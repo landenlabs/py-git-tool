@@ -12,8 +12,10 @@ import subprocess
 import sys
 import traceback
 
-VERSION = "v6.05.03 (May-2026)"
- 
+from version import __version__
+
+VERSION = "v%s" % __version__
+
 
 # ---------------------------------------------------------------------------
 # Color support
