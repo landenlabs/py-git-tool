@@ -1,8 +1,8 @@
 <table border="0">
   <tr>
     <td>
-      <!-- VERSION -->v6.07.05<br>
-      <!-- DATE -->09-Jul-2026<br>
+      <!-- VERSION -->v6.07.06<br>
+      <!-- DATE -->11-Jul-2026<br>
       macOS &nbsp;|&nbsp; Windows &nbsp;|&nbsp; Linux<br>
       <a href="https://landenlabs.com">Home</a>
     </td>
@@ -183,9 +183,8 @@ git-tool.py --branch --status ".*2024.*"
 
 ```
 git-tool/
-├── git-tool.py                  # Main script (single-file CLI)
-├── version.py                   # Version string (__version__)
-├── VERSION                      # Bare X.Y.Z, mirrors version.py
+├── git-tool.py                  # Main script (single-file CLI; hardcodes VERSION = "vX.Y.Z")
+├── VERSION                      # Bare X.Y.Z, mirrors git-tool.py's VERSION literal
 ├── set-version.bash             # Bump version, commit, tag, push (macOS/Linux)
 ├── set-version.ps1              # Bump version, commit, tag, push (Windows)
 ├── icon.png                     # App icon: baked into the release binaries, shown in README
@@ -210,9 +209,8 @@ the repo root:
 ./set-version.bash -version 1.0.1 -message "Fix rename-to-main edge case"
 ```
 
-This updates `VERSION`, `version.py` (`__version__`), and the `<!-- VERSION -->v6.07.05 /
-`<!-- DATE -->09-Jul-2026
-the release build above.
+This updates `VERSION`, the `VERSION` literal hardcoded in `git-tool.py`, and the
+version/date markers at the top of this README that feed the release build above.
 
 ---
 

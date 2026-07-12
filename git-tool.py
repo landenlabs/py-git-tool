@@ -12,9 +12,7 @@ import subprocess
 import sys
 import traceback
 
-from version import __version__
-
-VERSION = "v%s" % __version__
+VERSION = "v6.07.06"
 
 
 # ---------------------------------------------------------------------------
