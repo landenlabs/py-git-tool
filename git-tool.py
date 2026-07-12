@@ -425,6 +425,14 @@ def get_current_git_user():
         return None
 
 
+def get_remote_url(git_dir):
+    """Return the origin remote URL, or None."""
+    stdout, _, rc = run_git(git_dir, 'remote', 'get-url', 'origin')
+    if rc != 0:
+        return None
+    return stdout.strip() or None
+
+
 def get_remote_owner(git_dir):
     """Parse the origin remote URL and return the owner/org segment, or None."""
     stdout, _, rc = run_git(git_dir, 'remote', 'get-url', 'origin')
@@ -933,6 +941,13 @@ def report_repos(git_dirs, args, collector=None):
         if args.branch:
             current, local_count, remote_count = get_branch_info(d)
             lines.append(f"  branch:  {current}  ({local_count} local, {remote_count} remote)")
+
+        if args.summary:
+            repo_url = get_remote_url(d)
+            url_line = f"  url:     {repo_url or '(none)'}"
+            if repo_url and re.search(r'://[^/]*@', repo_url):
+                url_line = _c(url_line, _YELLOW)
+            lines.append(url_line)
 
         tag = None
         if args.tag:
