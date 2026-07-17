@@ -3,6 +3,7 @@
 # Distribution / packaging
 .Python
 build/
+dist/
 __pycache__/
 .claude/
 .claude/**
