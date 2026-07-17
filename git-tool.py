@@ -6,11 +6,17 @@
 """git-tool - Scan directories and report status about their git projects"""
 
 import argparse
+import base64
+import fnmatch
+import json
 import os
 import re
 import subprocess
 import sys
+import time
 import traceback
+import urllib.error
+import urllib.request
 
 VERSION = "v6.07.06"
 
@@ -447,6 +453,198 @@ def get_remote_owner(git_dir):
         parts = path.split('/')
         return parts[0] if parts else None
     return None
+
+
+# ---------------------------------------------------------------------------
+# --download command
+# ---------------------------------------------------------------------------
+
+def parse_github_url(url):
+    """
+    Parse a github.com URL into (owner, repo, ref, path, is_blob).
+
+    Supports:
+      https://github.com/OWNER/REPO
+      https://github.com/OWNER/REPO/tree/REF[/PATH]
+      https://github.com/OWNER/REPO/blob/REF/PATH
+
+    Branch names containing '/' aren't disambiguated from path segments;
+    the first segment after tree/blob is taken as the ref.
+    Returns None if the URL isn't recognized.
+    """
+    m = re.match(
+        r'^https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?'
+        r'(?:/(tree|blob)/([^/]+)(?:/(.*))?)?/?$',
+        url.strip(),
+    )
+    if not m:
+        return None
+    owner, repo, kind, ref, path = m.groups()
+    path = (path or '').rstrip('/')
+    is_blob = (kind == 'blob')
+    return owner, repo, ref or 'HEAD', path, is_blob
+
+
+def _github_headers(token):
+    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'git-tool'}
+    if token:
+        headers['Authorization'] = f'token {token}'
+    return headers
+
+
+def _urlopen_with_retry(req, retries=3, backoff=1.5, timeout=20):
+    """
+    Open req, retrying transient failures (connection reset, timeout, 5xx).
+    Real API errors (4xx) are raised immediately, not retried.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code < 500 or attempt == retries - 1:
+                raise
+            last_err = e
+        except urllib.error.URLError as e:
+            if attempt == retries - 1:
+                raise
+            last_err = e
+        time.sleep(backoff * (attempt + 1))
+    raise last_err
+
+
+def github_api_get(url, token):
+    """GET a GitHub API URL and return parsed JSON, or raise RuntimeError."""
+    req = urllib.request.Request(url, headers=_github_headers(token))
+    try:
+        with _urlopen_with_retry(req) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        try:
+            message = json.loads(body).get('message', '').strip()
+        except ValueError:
+            message = ''
+        hint = ''
+        if e.code == 403 and 'rate limit' in body.lower():
+            hint = ' (try --token to raise the rate limit)'
+        elif e.code == 404:
+            hint = ' (check the URL/ref/path, or use --token for a private repo)'
+        detail = f": {message}" if message else ''
+        raise RuntimeError(f"GitHub API error {e.code} for {url}{hint}{detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error fetching {url}: {e.reason}") from e
+
+
+def github_fetch_bytes(url, token):
+    """GET a URL and return raw bytes (used for contents-API download_url links)."""
+    req = urllib.request.Request(url, headers=_github_headers(token))
+    with _urlopen_with_retry(req) as resp:
+        return resp.read()
+
+
+def _write_file_entry(entry, dest_path, token):
+    """Write a single contents-API file entry (base64 content or download_url) to disk."""
+    if entry.get('content'):
+        data = base64.b64decode(entry['content'])
+    elif entry.get('download_url'):
+        data = github_fetch_bytes(entry['download_url'], token)
+    else:
+        raise RuntimeError(f"no content available for {entry.get('path')}")
+    os.makedirs(os.path.dirname(dest_path) or '.', exist_ok=True)
+    with open(dest_path, 'wb') as f:
+        f.write(data)
+
+
+def _matches_filters(rel_path, include, exclude):
+    """Return True if rel_path passes the --include/--exclude glob filters."""
+    name = os.path.basename(rel_path)
+    if include and not any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel_path, p) for p in include):
+        return False
+    if exclude and any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel_path, p) for p in exclude):
+        return False
+    return True
+
+
+def _download_contents(owner, repo, ref, path, dest_dir, token, recursive, include, exclude, base_path, stats):
+    """List `path` via the contents API and download matching files into dest_dir."""
+    api_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}'
+    listing = github_api_get(api_url, token)
+    if isinstance(listing, dict):
+        listing = [listing]
+
+    for entry in sorted(listing, key=lambda e: e['name'].lower()):
+        rel = entry['path'][len(base_path):].lstrip('/') if base_path else entry['path']
+
+        if entry['type'] == 'dir':
+            if not recursive:
+                print(f"  skip  {entry['path']}/  (directory; use --recursive to descend)")
+                stats['skipped'] += 1
+                continue
+            _download_contents(owner, repo, ref, entry['path'], dest_dir,
+                               token, recursive, include, exclude, base_path, stats)
+        elif entry['type'] == 'file':
+            if not _matches_filters(rel, include, exclude):
+                stats['skipped'] += 1
+                continue
+            file_entry = github_api_get(entry['url'], token)
+            dest_path = os.path.join(dest_dir, rel)
+            _write_file_entry(file_entry, dest_path, token)
+            print(f"  {dest_path}")
+            stats['downloaded'] += 1
+        else:
+            stats['skipped'] += 1
+
+
+def download_github_file(owner, repo, ref, path, output, token):
+    """Download a single file. Returns (downloaded, skipped) counts."""
+    api_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}'
+    entry = github_api_get(api_url, token)
+    if isinstance(entry, list):
+        raise RuntimeError(f"{path} is a directory; use a tree URL (and --recursive) instead")
+
+    dest = output
+    if not dest:
+        dest = os.path.basename(path)
+    elif os.path.isdir(dest):
+        dest = os.path.join(dest, os.path.basename(path))
+
+    _write_file_entry(entry, dest, token)
+    print(dest)
+    return 1, 0
+
+
+def download_github_dir(owner, repo, ref, path, output, token, recursive, include, exclude):
+    """Download a directory (optionally recursive). Returns (downloaded, skipped) counts."""
+    dest_dir = output or (os.path.basename(path) if path else repo)
+    stats = {'downloaded': 0, 'skipped': 0}
+    _download_contents(owner, repo, ref, path, dest_dir, token, recursive, include, exclude, path, stats)
+    return stats['downloaded'], stats['skipped']
+
+
+def cmd_download(args):
+    """Download a file or directory tree from a github.com URL. Returns a process exit code."""
+    parsed = parse_github_url(args.download)
+    if parsed is None:
+        print(f"Error: not a recognized github.com URL: {args.download}", file=sys.stderr)
+        return 1
+    owner, repo, ref, path, is_blob = parsed
+    token = args.token or os.environ.get('GITHUB_TOKEN')
+
+    try:
+        if is_blob:
+            downloaded, skipped = download_github_file(owner, repo, ref, path, args.output, token)
+        else:
+            downloaded, skipped = download_github_dir(
+                owner, repo, ref, path, args.output, token,
+                args.recursive, args.include, args.exclude,
+            )
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    print(f"\nDownloaded {downloaded} file(s); skipped {skipped}.")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1043,6 +1241,20 @@ def main():
   git-tool.py --summary "myproject"
   git-tool.py --branch --status ".*2024.*"
 
+  # Download a single file from GitHub:
+  git-tool.py --download https://github.com/OWNER/REPO/blob/main/path/file.py
+
+  # Download a directory (top-level files only, then recursively):
+  git-tool.py --download https://github.com/OWNER/REPO/tree/main/path/dir
+  git-tool.py --download https://github.com/OWNER/REPO/tree/main/path/dir --recursive
+
+  # Filter which files are downloaded, and pick a destination:
+  git-tool.py --download URL --recursive --include "*.ts" --exclude "*.test.ts" -o ./out
+
+  # Private repo (or to raise the API rate limit):
+  git-tool.py --download URL --token ghp_xxx
+  GITHUB_TOKEN=ghp_xxx git-tool.py --download URL
+
 Notes:
   When a directory path is given, it and all subdirectories are scanned.
   When a pattern is given, it is matched case-insensitively against the full
@@ -1121,12 +1333,43 @@ Notes:
         '--no-color', action='store_true',
         help='Disable colored status output',
     )
+    parser.add_argument(
+        '--download', metavar='URL',
+        help='Download a file or directory tree from a github.com URL',
+    )
+    parser.add_argument(
+        '--recursive', action='store_true',
+        help='With --download on a directory URL, descend into subdirectories',
+    )
+    parser.add_argument(
+        '--include', nargs='*', default=[], metavar='PATTERN',
+        help='With --download, only fetch files matching PATTERN (glob, repeatable)',
+    )
+    parser.add_argument(
+        '--exclude', nargs='*', default=[], metavar='PATTERN',
+        help='With --download, skip files matching PATTERN (glob, repeatable)',
+    )
+    parser.add_argument(
+        '--output', '-o', metavar='PATH',
+        help='Local destination file or directory for --download',
+    )
+    parser.add_argument(
+        '--token', metavar='TOKEN',
+        help='GitHub API token for --download (private repos / higher rate limit); '
+             'falls back to the GITHUB_TOKEN env var',
+    )
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
 
     args = parser.parse_args()
 
     if not args.no_color:
         _init_colors()
+
+    if args.download:
+        sys.exit(cmd_download(args))
+
+    if args.recursive or args.include or args.exclude or args.output or args.token:
+        parser.error("--recursive, --include, --exclude, --output, and --token require --download")
 
     # Merge --dir and trailing positional dirs into one list
     all_dirs = args.dir + args.dirs

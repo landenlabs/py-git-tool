@@ -20,7 +20,8 @@
 
 A cross-platform CLI that scans one or more directory trees for git repositories and
 reports their status, branch, tag, release, and disk size — with optional bulk actions
-to clean, pull, push, or rename `master` to `main`.
+to clean, pull, push, or rename `master` to `main`. Also supports downloading a single
+file or directory tree directly from a `github.com` URL, without cloning the repo.
 
 **By [LanDen Labs](https://github.com/landenlabs) (2026)**
 
@@ -58,6 +59,13 @@ _(coming soon)_
 - **End-of-run summary.** When `--summary` is used, prints a report with total `.git`
   size, largest repo, status counts (clean / error / pending / behind), branch counts,
   tag/release counts, and contributor list.
+- **GitHub download.** `--download URL` fetches a single file (`blob` URL) or a
+  directory (`tree` URL) straight from GitHub's API — no local clone required.
+  - `--recursive` descends into subdirectories (omit it to grab only the top-level files).
+  - `--include`/`--exclude` filter files by glob pattern.
+  - `--output` sets the local destination; `--token` (or `GITHUB_TOKEN`) authenticates
+    for private repos or a higher API rate limit.
+  - Transient network errors are retried automatically with backoff.
 - **Standard CLI.** `--version`, `--help` with examples, clean Ctrl-C handling.
 
 ---
@@ -161,6 +169,34 @@ git-tool.py --status myproject
 git-tool.py --branch --status ".*2024.*"
 ```
 
+### Download a file or directory from GitHub
+
+```bash
+# Single file (blob URL)
+git-tool.py --download https://github.com/OWNER/REPO/blob/main/path/file.py
+
+# Directory, top-level files only (tree URL, no --recursive)
+git-tool.py --download https://github.com/OWNER/REPO/tree/main/path/dir
+
+# Directory, including all subdirectories
+git-tool.py --download https://github.com/OWNER/REPO/tree/main/path/dir --recursive
+
+# Filter which files are downloaded, and choose a destination
+git-tool.py --download URL --recursive --include "*.ts" --exclude "*.test.ts" -o ./out
+
+# Private repo, or to raise the API rate limit (prefer the env var over --token
+# so the credential doesn't end up in shell history)
+GITHUB_TOKEN=ghp_xxx git-tool.py --download URL
+git-tool.py --download URL --token ghp_xxx
+```
+
+Notes:
+- `blob` URLs are for files, `tree` URLs are for directories — using the wrong one errors out.
+- Without `--recursive`, subdirectories inside a `tree` URL are listed as skipped, not descended into.
+- Classic tokens for organizations with SAML SSO enforced (e.g. many GitHub Enterprise
+  orgs) must be authorized for that org: on https://github.com/settings/tokens, click
+  **Configure SSO** next to the token and authorize it, even if scopes are already correct.
+
 ### All reporting flags
 
 | Flag | Purpose |
@@ -176,6 +212,17 @@ git-tool.py --branch --status ".*2024.*"
 | `--no-color` | Disable ANSI color output |
 | `--version` | Print version and exit |
 | `--help` | Show full usage and examples |
+
+### Download flags
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--download URL` | Fetch a file (`blob` URL) or directory (`tree` URL) from github.com |
+| `--recursive` | With a directory URL, descend into subdirectories |
+| `--include PATTERN` | Only fetch files matching a glob pattern (repeatable) |
+| `--exclude PATTERN` | Skip files matching a glob pattern (repeatable) |
+| `--output` / `-o` | Local destination file or directory |
+| `--token` | GitHub token for private repos / higher rate limit (or set `GITHUB_TOKEN`) |
 
 ---
 
