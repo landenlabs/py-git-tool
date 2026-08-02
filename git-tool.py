@@ -622,6 +622,151 @@ def download_github_dir(owner, repo, ref, path, output, token, recursive, includ
     return stats['downloaded'], stats['skipped']
 
 
+def parse_github_owner(s):
+    """
+    Parse a github.com owner out of a base URL or bare name.
+
+    Accepts 'github.com/OWNER', 'https://github.com/OWNER', or a bare 'OWNER'.
+    Returns None if the string doesn't look like a valid owner.
+    """
+    s = s.strip().rstrip('/')
+    m = re.match(r'^(?:https?://)?github\.com/([^/]+)$', s)
+    if m:
+        return m.group(1)
+    if re.match(r'^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$', s):
+        return s
+    return None
+
+
+def _github_list_all(url_base, token):
+    """GET a paginated GitHub list endpoint, returning the combined JSON array."""
+    results = []
+    page = 1
+    while True:
+        sep = '&' if '?' in url_base else '?'
+        batch = github_api_get(f'{url_base}{sep}per_page=100&page={page}', token)
+        results.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return results
+
+
+def list_github_repos(owner, token):
+    """Return repo dicts for a GitHub user or org, sorted by name. Tries /users then /orgs."""
+    try:
+        repos = _github_list_all(f'https://api.github.com/users/{owner}/repos', token)
+    except RuntimeError as e:
+        if '404' not in str(e):
+            raise
+        repos = _github_list_all(f'https://api.github.com/orgs/{owner}/repos', token)
+    return sorted(repos, key=lambda r: r['name'].lower())
+
+
+def cmd_list_repos(args):
+    """List repos for --host, optionally filtered by a --repo-list regex. Returns a process exit code."""
+    owner = parse_github_owner(args.host)
+    if owner is None:
+        print(f"Error: could not parse an owner from '{args.host}' "
+              f"(expected e.g. 'github.com/OWNER' or 'OWNER')", file=sys.stderr)
+        return 1
+    token = args.token or os.environ.get('GITHUB_TOKEN')
+
+    pattern = None
+    if args.repo_list:
+        try:
+            pattern = re.compile(args.repo_list, re.IGNORECASE)
+        except re.error as e:
+            print(f"Error: invalid pattern '{args.repo_list}': {e}", file=sys.stderr)
+            return 1
+
+    try:
+        repos = list_github_repos(owner, token)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    if pattern:
+        repos = [r for r in repos if pattern.search(r['name'])]
+
+    if not repos:
+        print(f"No repositories found for '{owner}'.")
+        return 0
+
+    for r in repos:
+        flags = []
+        if r.get('private'):  flags.append('private')
+        if r.get('fork'):     flags.append('fork')
+        if r.get('archived'): flags.append('archived')
+        flag_str = f"  [{', '.join(flags)}]" if flags else ''
+        print(f"{r['full_name']}{flag_str}")
+
+    n = len(repos)
+    print(f"\n{n} repositor{'ies' if n != 1 else 'y'} for {owner}.")
+    return 0
+
+
+def _clone_url_with_token(clone_url, token):
+    """Embed an auth token into an https clone URL, if given."""
+    if token and clone_url.startswith('https://'):
+        return clone_url.replace('https://', f'https://{token}@', 1)
+    return clone_url
+
+
+def cmd_repo_clone(args):
+    """Clone repos from --host whose name matches any --repo-clone pattern; skip existing dirs."""
+    owner = parse_github_owner(args.host)
+    if owner is None:
+        print(f"Error: could not parse an owner from '{args.host}' "
+              f"(expected e.g. 'github.com/OWNER' or 'OWNER')", file=sys.stderr)
+        return 1
+    token = args.token or os.environ.get('GITHUB_TOKEN')
+
+    patterns = []
+    for p in args.repo_clone:
+        try:
+            patterns.append(re.compile(p, re.IGNORECASE))
+        except re.error as e:
+            print(f"Warning: invalid pattern '{p}': {e}", file=sys.stderr)
+
+    if not patterns:
+        print("Error: no valid --repo-clone patterns given", file=sys.stderr)
+        return 1
+
+    try:
+        repos = list_github_repos(owner, token)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    matched = [r for r in repos if any(pat.search(r['name']) for pat in patterns)]
+
+    if not matched:
+        print(f"No repositories for '{owner}' matched the given pattern(s).")
+        return 0
+
+    cloned = skipped = errors = 0
+    for r in matched:
+        name = r['name']
+        if os.path.exists(name):
+            print(f"  skip  {name}  (directory already exists)")
+            skipped += 1
+            continue
+
+        clone_url = _clone_url_with_token(r['clone_url'], token)
+        print(f"clone  {name}")
+        result = subprocess.run(['git', 'clone', clone_url, name], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  ERROR: {result.stderr.strip()}", file=sys.stderr)
+            errors += 1
+        else:
+            cloned += 1
+        print()
+
+    print(f"Cloned {cloned} repo(s); skipped {skipped}; errors {errors}.")
+    return 1 if errors else 0
+
+
 def cmd_download(args):
     """Download a file or directory tree from a github.com URL. Returns a process exit code."""
     parsed = parse_github_url(args.download)
@@ -1255,6 +1400,17 @@ def main():
   git-tool.py --download URL --token ghp_xxx
   GITHUB_TOKEN=ghp_xxx git-tool.py --download URL
 
+  # List all repos for a GitHub user or org:
+  git-tool.py --host github.com/landenlabs --repo-list
+  git-tool.py --host landenlabs --repo-list --token ghp_xxx
+
+  # List repos whose name matches a pattern (regex):
+  git-tool.py --host landenlabs --repo-list "py.*"
+
+  # Clone repos whose name matches a pattern, skipping dirs that already exist:
+  git-tool.py --host github.com/landenlabs --repo-clone "py.*"
+  git-tool.py --host landenlabs --repo-clone py-tool1 --repo-clone py-tool2
+
 Notes:
   When a directory path is given, it and all subdirectories are scanned.
   When a pattern is given, it is matched case-insensitively against the full
@@ -1338,6 +1494,20 @@ Notes:
         help='Download a file or directory tree from a github.com URL',
     )
     parser.add_argument(
+        '--repo-list', nargs='?', const='', default=None, metavar='PATTERN',
+        help='List repos for --host, optionally filtered by PATTERN (regex); '
+             'omit PATTERN to list all',
+    )
+    parser.add_argument(
+        '--host', metavar='OWNER_OR_URL',
+        help='Git base for --repo-list/--repo-clone, e.g. github.com/OWNER or OWNER',
+    )
+    parser.add_argument(
+        '--repo-clone', action='append', default=[], metavar='PATTERN',
+        help='Clone repos from --host whose name matches PATTERN (regex); '
+             'skips directories that already exist. Repeatable.',
+    )
+    parser.add_argument(
         '--recursive', action='store_true',
         help='With --download on a directory URL, descend into subdirectories',
     )
@@ -1368,8 +1538,26 @@ Notes:
     if args.download:
         sys.exit(cmd_download(args))
 
-    if args.recursive or args.include or args.exclude or args.output or args.token:
-        parser.error("--recursive, --include, --exclude, --output, and --token require --download")
+    if args.repo_list is not None and not args.host:
+        parser.error("--repo-list requires --host")
+
+    if args.repo_clone and not args.host:
+        parser.error("--repo-clone requires --host")
+
+    if args.host and args.repo_list is None and not args.repo_clone:
+        parser.error("--host requires --repo-list or --repo-clone")
+
+    if args.repo_list is not None:
+        sys.exit(cmd_list_repos(args))
+
+    if args.repo_clone:
+        sys.exit(cmd_repo_clone(args))
+
+    if args.recursive or args.include or args.exclude or args.output:
+        parser.error("--recursive, --include, --exclude, and --output require --download")
+
+    if args.token:
+        parser.error("--token requires --download, --repo-list, or --repo-clone")
 
     # Merge --dir and trailing positional dirs into one list
     all_dirs = args.dir + args.dirs
