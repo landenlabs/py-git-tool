@@ -1283,12 +1283,18 @@ def report_repos(git_dirs, args, collector=None):
             current, local_count, remote_count = get_branch_info(d)
             lines.append(f"  branch:  {current}  ({local_count} local, {remote_count} remote)")
 
+        contributors = repo_owner = None
         if args.summary:
             repo_url = get_remote_url(d)
             url_line = f"  url:     {repo_url or '(none)'}"
             if repo_url and re.search(r'://[^/]*@', repo_url):
                 url_line = _c(url_line, _YELLOW)
             lines.append(url_line)
+
+            contributors = get_contributors(d)
+            repo_owner   = get_remote_owner(d)
+            contrib_str  = ', '.join(sorted(contributors, key=str.lower)) if contributors else '(none)'
+            lines.append(f"  contributors: {contrib_str}")
 
         tag = None
         if args.tag:
@@ -1316,10 +1322,6 @@ def report_repos(git_dirs, args, collector=None):
             for line in format_size(d, args.verbose, size_bytes):
                 lines.append(line)
 
-        contributors = repo_owner = None
-        if collector is not None:
-            contributors = get_contributors(d)
-            repo_owner   = get_remote_owner(d)
         if collector is not None:
             collector.record(d, current, s, unpushed, tag, release, size_bytes, contributors, repo_owner)
 
