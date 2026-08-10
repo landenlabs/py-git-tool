@@ -106,12 +106,22 @@ def _scan_subtree(root):
             yield from _scan_subtree(entry.path)
 
 
+def _find_repo_toplevel(start_dir):
+    """Return the top-level directory of the git repo containing start_dir, or None."""
+    stdout, _, rc = run_git(start_dir, 'rev-parse', '--show-toplevel')
+    if rc != 0:
+        return None
+    return stdout.strip() or None
+
+
 def find_git_dirs(dir_args, verbose=False):
     """
     Return a deduplicated list of git repository directories.
 
     Each item in dir_args is handled as follows:
-      - Existing directory path → check it directly, then scan children for .git.
+      - Existing directory path → check it directly, then scan children for .git;
+                                  if neither finds a repo, walk up (via
+                                  git rev-parse --show-toplevel) to the enclosing repo.
       - Non-existent path       → treat as a case-insensitive regex; walk cwd and
                                   collect paths whose full name matches.
     """
@@ -134,8 +144,17 @@ def find_git_dirs(dir_args, verbose=False):
             if os.path.exists(os.path.join(expanded, '.git')):
                 _add(expanded)
             else:
+                found_nested = False
                 for p in _scan_subtree(expanded):
                     _add(p)
+                    found_nested = True
+                if not found_nested:
+                    toplevel = _find_repo_toplevel(expanded)
+                    if toplevel:
+                        if verbose:
+                            print(f"  no nested repos; using enclosing repo: {toplevel}",
+                                  file=sys.stderr)
+                        _add(toplevel)
         else:
             # Treat as regex pattern and walk from cwd
             try:
@@ -1525,6 +1544,7 @@ Notes:
   When a pattern is given, it is matched case-insensitively against the full
   path of each directory found while walking the current directory.
   --dir and trailing arguments can be mixed: --dir ~/a ~/b ~/c
+  If neither is given, the current directory (.) is used.
   Repos nested inside another repo are not scanned recursively.
 """,
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1532,7 +1552,8 @@ Notes:
 
     parser.add_argument(
         '--dir', nargs='*', default=[], metavar='PATH_OR_PATTERN',
-        help='Directory paths or regex patterns to locate git repositories',
+        help='Directory paths or regex patterns to locate git repositories '
+             '(default: current directory)',
     )
     parser.add_argument(
         'dirs', nargs='*', default=[], metavar='PATH_OR_PATTERN',
@@ -1674,11 +1695,8 @@ Notes:
     if args.token:
         parser.error("--token requires --download, --repo-list, or --repo-clone")
 
-    # Merge --dir and trailing positional dirs into one list
-    all_dirs = args.dir + args.dirs
-    if not all_dirs:
-        parser.error("provide at least one directory or pattern "
-                     "(via --dir or as trailing arguments)")
+    # Merge --dir and trailing positional dirs into one list; default to cwd
+    all_dirs = args.dir + args.dirs or ['.']
 
     # Expand --summary into its constituent flags
     if args.summary:
