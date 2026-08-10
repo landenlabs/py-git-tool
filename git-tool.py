@@ -1021,6 +1021,108 @@ def cmd_rename_to_main(git_dirs, args):
 
 
 # ---------------------------------------------------------------------------
+# --delete-branch command
+# ---------------------------------------------------------------------------
+
+def branch_exists_local(git_dir, branch):
+    """Return True if branch exists as a local branch."""
+    out, _, _ = run_git(git_dir, 'branch', '--list', branch)
+    return bool(out.strip())
+
+
+def branch_exists_remote(git_dir, branch, remote='origin'):
+    """Return True if branch exists on remote."""
+    out, _, _ = run_git(git_dir, 'ls-remote', '--heads', remote, branch)
+    return bool(out.strip())
+
+
+def branch_is_merged(git_dir, branch):
+    """Return True if branch has been merged into the current HEAD."""
+    _, _, rc = run_git(git_dir, 'merge-base', '--is-ancestor', branch, 'HEAD')
+    return rc == 0
+
+
+def cmd_delete_branch(git_dirs, args):
+    """Delete a branch both locally and on the remote, after confirmation."""
+    branch = args.delete_branch
+    dry = args.dry_run
+    deleted = skipped = errors = 0
+
+    for d in git_dirs:
+        remote_out, _, _ = run_git(d, 'remote')
+        has_origin = 'origin' in remote_out.split()
+
+        if has_origin:
+            _, stderr, rc = run_git(d, 'fetch', '--all', '--prune')
+            if rc != 0:
+                print(f"  WARNING  {d}  (fetch --all --prune failed: {stderr.strip()})",
+                      file=sys.stderr)
+
+        has_local  = branch_exists_local(d, branch)
+        has_remote = has_origin and branch_exists_remote(d, branch)
+
+        if not has_local and not has_remote:
+            skipped += 1
+            continue
+
+        if get_branch(d) == branch:
+            print(f"  skip  {d}  (branch '{branch}' is currently checked out)")
+            skipped += 1
+            continue
+
+        merged = branch_is_merged(d, branch) if has_local else None
+        merged_str = ('merged' if merged else 'NOT merged') if merged is not None else 'unknown'
+
+        where = []
+        if has_local:  where.append('local')
+        if has_remote: where.append('remote')
+
+        print(d)
+        print(f"  branch:  {branch}  ({', '.join(where)})  [{merged_str}]")
+
+        if dry:
+            print(f"  [dry-run] would delete {', '.join(where)}")
+            print()
+            deleted += 1
+            continue
+
+        reply = input(f"  Delete branch '{branch}' ({', '.join(where)}, {merged_str})? [y/N] ").strip().lower()
+        if reply != 'y':
+            print("  skipped")
+            print()
+            skipped += 1
+            continue
+
+        ok = True
+        if has_local:
+            _, stderr, rc = run_git(d, 'branch', '-D', branch)
+            if rc != 0:
+                print(f"  ERROR (local delete): {stderr.strip()}", file=sys.stderr)
+                errors += 1
+                ok = False
+            else:
+                print(f"  deleted local branch '{branch}'")
+
+        if ok and has_remote:
+            _, stderr, rc = run_git(d, 'push', 'origin', '--delete', branch)
+            if rc != 0:
+                print(f"  ERROR (remote delete): {stderr.strip()}", file=sys.stderr)
+                errors += 1
+                ok = False
+            else:
+                print(f"  deleted remote branch 'origin/{branch}'")
+
+        if ok:
+            deleted += 1
+        print()
+
+    if dry:
+        print(f"Would delete branch '{branch}' in {deleted} repo(s); {skipped} skipped.")
+    else:
+        print(f"Deleted branch '{branch}' in {deleted} repo(s); {skipped} skipped; {errors} errors.")
+
+
+# ---------------------------------------------------------------------------
 # --clean command
 # ---------------------------------------------------------------------------
 
@@ -1370,6 +1472,11 @@ def main():
   git-tool.py --main ~/projects
   git-tool.py --main --dry-run ~/projects
 
+  # Delete a branch locally and on the remote (prompts for confirmation,
+  # shows merge status; runs "git fetch --all --prune" first):
+  git-tool.py --delete-branch old-feature ~/projects
+  git-tool.py --delete-branch old-feature --dry-run ~/projects
+
   # Fetch, prune, and gc all repos:
   git-tool.py --clean ~/projects
   git-tool.py --clean --dry-run ~/projects
@@ -1460,6 +1567,11 @@ Notes:
         help='Rename master -> main where master exists and main does not (local + remote)',
     )
     parser.add_argument(
+        '--delete-branch', metavar='BRANCH',
+        help='Delete BRANCH both locally and on the remote (with confirmation, '
+             'showing merge status); runs "git fetch --all --prune" first',
+    )
+    parser.add_argument(
         '--clean', action='store_true',
         help='Run fetch --prune, worktree prune, and gc --auto on each repo',
     )
@@ -1477,7 +1589,8 @@ Notes:
     )
     parser.add_argument(
         '--dry-run', action='store_true',
-        help='Preview what --main, --clean, --pull, or --push would do without making changes',
+        help='Preview what --main, --delete-branch, --clean, --pull, or --push '
+             'would do without making changes',
     )
     parser.add_argument(
         '--verbose', '-v', action='store_true',
@@ -1572,12 +1685,14 @@ Notes:
         args.branch = args.status = args.tag = args.release = args.size = True
 
     reporting = args.branch or args.status or args.tag or args.release or args.size or args.dirty
-    if not reporting and not args.main and not args.clean and not args.pull and not args.push:
+    if not reporting and not args.main and not args.delete_branch and not args.clean \
+            and not args.pull and not args.push:
         parser.error("specify at least one of --branch, --status, --tag, --release, "
-                     "--size, --summary, --dirty, --main, --clean, --pull, or --push")
+                     "--size, --summary, --dirty, --main, --delete-branch, --clean, "
+                     "--pull, or --push")
 
-    if args.dry_run and not (args.main or args.clean or args.pull or args.push):
-        parser.error("--dry-run only applies to --main, --clean, --pull, or --push")
+    if args.dry_run and not (args.main or args.delete_branch or args.clean or args.pull or args.push):
+        parser.error("--dry-run only applies to --main, --delete-branch, --clean, --pull, or --push")
 
     if args.push and not args.message and not args.dry_run:
         parser.error("--push requires --message")
@@ -1600,6 +1715,8 @@ Notes:
             report_repos(git_dirs, args, collector)
         if args.main:
             cmd_rename_to_main(git_dirs, args)
+        if args.delete_branch:
+            cmd_delete_branch(git_dirs, args)
         if args.clean:
             cmd_clean(git_dirs, args)
         if args.pull:
