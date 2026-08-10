@@ -1091,13 +1091,14 @@ def cmd_delete_branch(git_dirs, args):
 
         merged = branch_is_merged(d, branch) if has_local else None
         merged_str = ('merged' if merged else 'NOT merged') if merged is not None else 'unknown'
+        merged_disp = _c(merged_str, _GREEN) if merged else merged_str
 
         where = []
         if has_local:  where.append('local')
         if has_remote: where.append('remote')
 
         print(d)
-        print(f"  branch:  {branch}  ({', '.join(where)})  [{merged_str}]")
+        print(f"  branch:  {branch}  ({', '.join(where)})  [{merged_disp}]")
 
         if dry:
             print(f"  [dry-run] would delete {', '.join(where)}")
@@ -1105,7 +1106,7 @@ def cmd_delete_branch(git_dirs, args):
             deleted += 1
             continue
 
-        reply = input(f"  Delete branch '{branch}' ({', '.join(where)}, {merged_str})? [y/N] ").strip().lower()
+        reply = input(f"  Delete branch '{branch}' ({', '.join(where)}, {merged_disp})? [y/N] ").strip().lower()
         if reply != 'y':
             print("  skipped")
             print()
