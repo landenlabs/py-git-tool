@@ -119,9 +119,10 @@ def find_git_dirs(dir_args, verbose=False):
     Return a deduplicated list of git repository directories.
 
     Each item in dir_args is handled as follows:
-      - Existing directory path → check it directly, then scan children for .git;
-                                  if neither finds a repo, walk up (via
-                                  git rev-parse --show-toplevel) to the enclosing repo.
+      - Existing directory path → check it directly; if it isn't a repo itself,
+                                  walk up (via git rev-parse --show-toplevel) to
+                                  the enclosing repo base; only if that also
+                                  fails does it scan children for nested repos.
       - Non-existent path       → treat as a case-insensitive regex; walk cwd and
                                   collect paths whose full name matches.
     """
@@ -144,17 +145,20 @@ def find_git_dirs(dir_args, verbose=False):
             if os.path.exists(os.path.join(expanded, '.git')):
                 _add(expanded)
             else:
-                found_nested = False
-                for p in _scan_subtree(expanded):
-                    _add(p)
-                    found_nested = True
-                if not found_nested:
-                    toplevel = _find_repo_toplevel(expanded)
-                    if toplevel:
-                        if verbose:
-                            print(f"  no nested repos; using enclosing repo: {toplevel}",
-                                  file=sys.stderr)
-                        _add(toplevel)
+                # Not a repo itself — prefer the enclosing repo base (if any)
+                # over scanning for unrelated nested repos underneath us, so
+                # running from a subdirectory of a repo (e.g. one containing
+                # submodule checkouts) resolves to that repo, not its nested
+                # checkouts.
+                toplevel = _find_repo_toplevel(expanded)
+                if toplevel:
+                    if verbose:
+                        print(f"  inside a repo; using enclosing repo base: {toplevel}",
+                              file=sys.stderr)
+                    _add(toplevel)
+                else:
+                    for p in _scan_subtree(expanded):
+                        _add(p)
         else:
             # Treat as regex pattern and walk from cwd
             try:
