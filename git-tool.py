@@ -1241,6 +1241,33 @@ def cmd_clean(git_dirs, args):
 
 
 # ---------------------------------------------------------------------------
+# --tag-list command
+# ---------------------------------------------------------------------------
+
+def cmd_tag_list(git_dirs, args):
+    """List every tag (newest first) with its date and a matching line from a file at that tag."""
+    tag_file = args.tag_file
+    tag_text = args.tag_text
+
+    for d in git_dirs:
+        tags_out, _, _ = run_git(d, 'tag', '-l', '--sort=-creatordate')
+        tags = tags_out.split()
+        print(f"tags  {d}")
+        print(f"{'TAG NAME':<20} | {'DATE':<12} | {tag_text} ({tag_file})")
+        print('-' * 65)
+        if not tags:
+            print("(no tags)\n")
+            continue
+        for tag in tags:
+            date_out, _, _ = run_git(d, 'log', '-1', '--format=%cd', '--date=short', tag)
+            grep_out, _, _ = run_git(d, 'grep', '-h', '-F', tag_text, tag, '--', tag_file)
+            lines = grep_out.strip().splitlines()
+            version_line = ' '.join(lines[0].split()) if lines else "[Not found / File missing]"
+            print(f"{tag:<20} | {date_out.strip():<12} | {version_line}")
+        print()
+
+
+# ---------------------------------------------------------------------------
 # --pull command
 # ---------------------------------------------------------------------------
 
@@ -1501,6 +1528,10 @@ def main():
   git-tool.py --delete-branch old-feature ~/projects
   git-tool.py --delete-branch old-feature --dry-run ~/projects
 
+  # List every tag with its date and a version line from a file at that tag:
+  git-tool.py --tag-list .
+  git-tool.py --tag-list --tag-file app/build.gradle --tag-text ext.PLUGIN_VERSION .
+
   # Fetch, prune, and gc all repos:
   git-tool.py --clean ~/projects
   git-tool.py --clean --dry-run ~/projects
@@ -1596,6 +1627,19 @@ Notes:
         '--delete-branch', metavar='BRANCH',
         help='Delete BRANCH both locally and on the remote (with confirmation, '
              'showing merge status); runs "git fetch --all --prune" first',
+    )
+    parser.add_argument(
+        '--tag-list', action='store_true',
+        help='List all tags (newest first) with date and the --tag-text line found '
+             'in --tag-file at that tag',
+    )
+    parser.add_argument(
+        '--tag-file', metavar='FILE', default='app/build.gradle',
+        help='File searched at each tag by --tag-list (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--tag-text', metavar='TEXT', default='ext.PLUGIN_VERSION',
+        help='Text searched for in --tag-file by --tag-list (default: %(default)s)',
     )
     parser.add_argument(
         '--clean', action='store_true',
@@ -1709,10 +1753,10 @@ Notes:
 
     reporting = args.branch or args.status or args.tag or args.release or args.size or args.dirty
     if not reporting and not args.main and not args.delete_branch and not args.clean \
-            and not args.pull and not args.push:
+            and not args.pull and not args.push and not args.tag_list:
         parser.error("specify at least one of --branch, --status, --tag, --release, "
-                     "--size, --summary, --dirty, --main, --delete-branch, --clean, "
-                     "--pull, or --push")
+                     "--size, --summary, --dirty, --tag-list, --main, --delete-branch, "
+                     "--clean, --pull, or --push")
 
     if args.dry_run and not (args.main or args.delete_branch or args.clean or args.pull or args.push):
         parser.error("--dry-run only applies to --main, --delete-branch, --clean, --pull, or --push")
@@ -1736,6 +1780,8 @@ Notes:
     try:
         if reporting:
             report_repos(git_dirs, args, collector)
+        if args.tag_list:
+            cmd_tag_list(git_dirs, args)
         if args.main:
             cmd_rename_to_main(git_dirs, args)
         if args.delete_branch:
