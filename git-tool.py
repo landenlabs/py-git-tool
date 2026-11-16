@@ -17,6 +17,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 VERSION = "v6.07.06"
 
@@ -1295,7 +1296,7 @@ def get_default_branch(git_dir):
     return cur, cur
 
 
-def get_pull_requests(git_dir, token):
+def get_pull_requests(git_dir, token, warnings=None):
     """
     Return {head_branch_name: (number, state, base_branch)} for PRs on the github.com origin.
     state is 'open', 'merged', or 'closed'. Uses the GitHub API when a token is
@@ -1339,7 +1340,11 @@ def get_pull_requests(git_dir, token):
                 prs.clear()
                 _from_api()
     except (RuntimeError, ValueError) as e:
-        print(f"  WARNING  {git_dir}  (could not fetch pull requests: {e})", file=sys.stderr)
+        msg = f"  WARNING  {git_dir}  (could not fetch pull requests: {e})"
+        if warnings is not None:
+            warnings.append(msg)
+        else:
+            print(msg, file=sys.stderr)
         return None
 
     # Prefer open > merged > closed, then the newest PR number.
@@ -1354,7 +1359,7 @@ def get_pull_requests(git_dir, token):
     return result
 
 
-def _branch_state(name, ref, is_current, default_name, default_ref, git_dir, prs):
+def _branch_state(name, is_current, is_merged, ahead, default_name, prs):
     """Return (state_text, color) - one mutually exclusive merge/PR/delete state."""
     if name == default_name:
         return 'default', None
@@ -1363,75 +1368,132 @@ def _branch_state(name, ref, is_current, default_name, default_ref, git_dir, prs
     pr = prs.get(name) if prs else None
     if pr and pr[1] == 'open':
         return f'PR #{pr[0]} open -> {pr[2]}', _YELLOW
-    _, _, rc = run_git(git_dir, 'merge-base', '--is-ancestor', ref, default_ref)
-    if rc == 0:
+    if is_merged:
         return 'merged - safe to delete', _GREEN
     if pr and pr[1] == 'merged':
         return f'PR #{pr[0]} merged -> {pr[2]} - safe to delete', _GREEN
-    ahead_out, _, _ = run_git(git_dir, 'rev-list', '--count', f'{default_ref}..{ref}')
-    ahead = ahead_out.strip() or '?'
     if pr and pr[1] == 'closed':
         return f'PR #{pr[0]} closed (-> {pr[2]}), unmerged (+{ahead})', _RED
     return f'unmerged (+{ahead})', _RED
 
 
-def cmd_branch_details(git_dirs, args):
-    """Report owner, last-change date, and merged/PR/safe-to-delete state of every branch."""
-    token = args.token or os.environ.get('GITHUB_TOKEN')
-
-    for d in git_dirs:
-        remote_out, _, _ = run_git(d, 'remote')
-        if remote_out.strip():
-            _, stderr, rc = run_git(d, 'fetch', '--all', '--prune', '--quiet')
-            if rc != 0:
-                print(f"  WARNING  {d}  (fetch --all --prune failed: {stderr.strip()})",
-                      file=sys.stderr)
-
-        default_ref, default_name = get_default_branch(d)
-        current = get_branch(d)
-        prs = get_pull_requests(d, token) if remote_out.strip() else None
-
-        refs_out, _, _ = run_git(
-            d, 'for-each-ref', '--sort=-committerdate',
-            '--format=%(refname)\t%(refname:short)\t%(committerdate:short)\t%(authorname)',
-            'refs/heads', 'refs/remotes')
-
-        rows = []
-        for line in refs_out.splitlines():
-            parts = line.split('\t')
-            if len(parts) != 4:
-                continue
-            full, short, date, tip_author = parts
-            if full.endswith('/HEAD'):
-                continue
-            is_remote = full.startswith('refs/remotes/')
-            name = short.split('/', 1)[1] if is_remote and '/' in short else short
-            # Owner: author of the oldest commit unique to this branch, else the tip author.
-            owner = tip_author
-            if name != default_name:
-                log_out, _, _ = run_git(d, 'log', '--reverse', '--format=%an', f'{default_ref}..{full}')
-                first = log_out.split('\n', 1)[0].strip()
-                if first:
-                    owner = first
-            state, color = _branch_state(name, full, (not is_remote and short == current),
-                                         default_name, default_ref, d, prs)
-            rows.append(('remote' if is_remote else 'local', short, owner, date, state, color))
-
-        rows.sort(key=lambda r: (r[0] != 'local',))   # local first; date order kept within
-
-        print(f"branches  {d}  (default: {default_ref}"
-              + ('' if prs is not None else ', PR info unavailable') + ')')
-        if not rows:
-            print("(no branches)\n")
+def _list_branch_refs(git_dir, default_ref):
+    """
+    Return [(full, short, date, tip_author, ahead_or_None)] for all local + remote
+    branches, newest first. ahead comes from one batched %(ahead-behind:...) call
+    (git 2.41+); on older git it is None and must be computed per branch.
+    """
+    base_fmt = '%(refname)\t%(refname:short)\t%(committerdate:short)\t%(authorname)'
+    out, _, rc = run_git(git_dir, 'for-each-ref', '--sort=-committerdate',
+                         f'--format={base_fmt}\t%(ahead-behind:{default_ref})',
+                         'refs/heads', 'refs/remotes')
+    has_ahead = rc == 0
+    if not has_ahead:
+        out, _, _ = run_git(git_dir, 'for-each-ref', '--sort=-committerdate',
+                            f'--format={base_fmt}', 'refs/heads', 'refs/remotes')
+    refs = []
+    for line in out.splitlines():
+        parts = line.split('\t')
+        if len(parts) < 4 or parts[0].endswith('/HEAD'):
             continue
+        ahead = None
+        if has_ahead and len(parts) > 4 and parts[4].split():
+            ahead = parts[4].split()[0]
+        refs.append((parts[0], parts[1], parts[2], parts[3], ahead))
+    return refs
+
+
+def _branch_owner(git_dir, default_ref, full, tip_author):
+    """Author of the oldest commit unique to this branch, else the tip author."""
+    log_out, _, _ = run_git(git_dir, 'log', '--reverse', '--format=%an', f'{default_ref}..{full}')
+    first = log_out.split('\n', 1)[0].strip()
+    return first or tip_author
+
+
+def _branch_details_repo(d, token, pool):
+    """Build the --branch-details report for one repo. Returns (report_text, warnings)."""
+    warnings = []
+    remote_out, _, _ = run_git(d, 'remote')
+    has_remote = bool(remote_out.strip())
+
+    # The PR lookup is network-bound and independent of the fetch; run it alongside.
+    pr_future = pool.submit(get_pull_requests, d, token, warnings) if has_remote else None
+    if has_remote:
+        _, stderr, rc = run_git(d, 'fetch', '--all', '--prune', '--quiet')
+        if rc != 0:
+            warnings.append(f"  WARNING  {d}  (fetch --all --prune failed: {stderr.strip()})")
+
+    default_ref, default_name = get_default_branch(d)
+    current = get_branch(d)
+    refs = _list_branch_refs(d, default_ref)
+    merged_out, _, _ = run_git(d, 'for-each-ref', '--format=%(refname)',
+                               f'--merged={default_ref}', 'refs/heads', 'refs/remotes')
+    merged = set(merged_out.split())
+
+    # Per-branch git work (owner, and ahead count on old git) only for unmerged branches.
+    jobs = {}
+    for full, short, date, tip_author, ahead in refs:
+        is_remote = full.startswith('refs/remotes/')
+        name = short.split('/', 1)[1] if is_remote and '/' in short else short
+        if name == default_name or full in merged:
+            continue
+        jobs[full] = (pool.submit(_branch_owner, d, default_ref, full, tip_author),
+                      None if ahead is not None else
+                      pool.submit(run_git, d, 'rev-list', '--count', f'{default_ref}..{full}'))
+
+    prs = pr_future.result() if pr_future else None
+
+    rows = []
+    for full, short, date, tip_author, ahead in refs:
+        is_remote = full.startswith('refs/remotes/')
+        name = short.split('/', 1)[1] if is_remote and '/' in short else short
+        owner = tip_author
+        if full in jobs:
+            owner_f, ahead_f = jobs[full]
+            owner = owner_f.result()
+            if ahead_f is not None:
+                ahead = ahead_f.result()[0].strip() or '?'
+        state, color = _branch_state(name, (not is_remote and short == current),
+                                     full in merged, ahead or '?', default_name, prs)
+        rows.append(('remote' if is_remote else 'local', short, owner, date, state, color))
+
+    rows.sort(key=lambda r: (r[0] != 'local',))   # local first; date order kept within
+
+    lines = [f"branches  {d}  (default: {default_ref}"
+             + ('' if prs is not None or not has_remote else ', PR info unavailable') + ')']
+    if not rows:
+        lines.append("(no branches)")
+    else:
         headers = ('WHERE', 'BRANCH', 'OWNER', 'LAST CHANGE', 'STATE')
         widths = [max(len(headers[i]), *(len(r[i]) for r in rows)) for i in range(4)]
         fmt = '  '.join(f'{{:<{w}}}' for w in widths)
-        print(fmt.format(*headers[:4]) + '  ' + headers[4])
-        print('-' * (sum(widths) + 2 * 4 + max(len(headers[4]), *(len(r[4]) for r in rows))))
+        lines.append(fmt.format(*headers[:4]) + '  ' + headers[4])
+        lines.append('-' * (sum(widths) + 2 * 4 + max(len(headers[4]), *(len(r[4]) for r in rows))))
         for where, short, owner, date, state, color in rows:
-            print(fmt.format(where, short, owner, date) + '  ' + (_c(state, color) if color else state))
-        print()
+            lines.append(fmt.format(where, short, owner, date) + '  '
+                         + (_c(state, color) if color else state))
+    return '\n'.join(lines) + '\n', warnings
+
+
+def cmd_branch_details(git_dirs, args):
+    """Report owner, last-change date, and merged/PR/safe-to-delete state of every branch."""
+    token = args.token or os.environ.get('GITHUB_TOKEN')
+    jobs = max(1, args.jobs)
+    # Two pools: repo-level tasks block waiting on per-branch tasks, so they must
+    # not share a pool (that could deadlock once every worker is a waiting repo).
+    repo_pool = ThreadPoolExecutor(max_workers=jobs)
+    work_pool = ThreadPoolExecutor(max_workers=jobs)
+    try:
+        futures = [repo_pool.submit(_branch_details_repo, d, token, work_pool) for d in git_dirs]
+        # Print in input order; each repo prints as soon as it and all earlier repos finish.
+        for f in futures:
+            report, warnings = f.result()
+            for w in warnings:
+                print(w, file=sys.stderr)
+            print(report)
+    finally:
+        repo_pool.shutdown(wait=False, cancel_futures=True)
+        work_pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1702,6 +1764,7 @@ def main():
   # Every local + remote branch: owner, last change, merged/PR/safe-to-delete state:
   git-tool.py --branch-details .
   git-tool.py --branch-details --token ghp_xxx .
+  git-tool.py --branch-details --jobs 16 ~/projects
 
   # Fetch, prune, and gc all repos:
   git-tool.py --clean ~/projects
@@ -1811,6 +1874,11 @@ Notes:
              'PR merged -> BASE - safe to delete / PR closed (-> BASE), unmerged / unmerged (+N ahead).\n'
              'Runs "git fetch --all --prune" first. PR info (github.com only) uses\n'
              '--token/GITHUB_TOKEN, else the gh CLI, else the public API',
+    )
+    parser.add_argument(
+        '--jobs', '-j', type=int, default=8, metavar='N',
+        help='Parallel workers for --branch-details (repos and per-branch git calls; '
+             'default: %(default)s)',
     )
     parser.add_argument(
         '--tag-file', metavar='FILE', default='app/build.gradle',

@@ -51,7 +51,8 @@ _(coming soon)_
     `default`, `checked out`, `PR #N open -> BASE`, `merged - safe to delete`,
     `PR #N merged -> BASE - safe to delete` (squash merges), `PR #N closed (-> BASE), unmerged (+N)`, or
     `unmerged (+N)`. PR info is github.com only and uses `--token`/`GITHUB_TOKEN`,
-    else the `gh` CLI, else the public API.
+    else the `gh` CLI, else the public API. Repos and per-branch lookups run in
+    parallel; `--jobs N` (default 8) sets the worker count.
 - **ANSI color output.** Red = error, yellow = behind remote, green = local changes.
   Respects `NO_COLOR` and `--no-color`. Windows virtual terminal processing is enabled
   automatically.
@@ -172,6 +173,7 @@ git-tool.py --main ~/projects
 ```bash
 git-tool.py --branch-details .
 git-tool.py --branch-details --token ghp_xxx ~/projects
+git-tool.py --branch-details --jobs 16 ~/projects
 ```
 
 ### Search by regex pattern
