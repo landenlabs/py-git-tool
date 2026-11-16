@@ -46,6 +46,12 @@ _(coming soon)_
   - `--size` — `.git` directory disk usage, packed size, and loose object size.
   - `--summary` — shorthand for all five flags above, plus an end-of-run summary report.
   - `--dirty` — suppress clean repos; show only repos with pending changes or errors.
+  - `--branch-details` — every local and remote branch in columns: owner (author of the
+    branch's first unique commit), last-change date, and one state column —
+    `default`, `checked out`, `PR #N open`, `merged - safe to delete`,
+    `PR #N merged - safe to delete` (squash merges), `PR #N closed, unmerged (+N)`, or
+    `unmerged (+N)`. PR info is github.com only and uses `--token`/`GITHUB_TOKEN`,
+    else the `gh` CLI, else the public API.
 - **ANSI color output.** Red = error, yellow = behind remote, green = local changes.
   Respects `NO_COLOR` and `--no-color`. Windows virtual terminal processing is enabled
   automatically.
@@ -159,6 +165,13 @@ git-tool.py --push -m "wip" --dry-run ~/projects
 ```bash
 git-tool.py --main --dry-run ~/projects
 git-tool.py --main ~/projects
+```
+
+### Branch details (owner, last change, merged / PR / safe to delete)
+
+```bash
+git-tool.py --branch-details .
+git-tool.py --branch-details --token ghp_xxx ~/projects
 ```
 
 ### Search by regex pattern

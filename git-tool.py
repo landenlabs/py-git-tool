@@ -1268,6 +1268,171 @@ def cmd_tag_list(git_dirs, args):
 
 
 # ---------------------------------------------------------------------------
+# --branch-details command
+# ---------------------------------------------------------------------------
+
+def parse_github_remote(url):
+    """Return (owner, repo) for a github.com https/ssh remote URL, else None."""
+    if not url:
+        return None
+    m = re.match(r'^(?:https?://(?:[^@/]+@)?|ssh://git@|git@)github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$',
+                 url.strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def get_default_branch(git_dir):
+    """Return (ref, short_name) of the default branch, e.g. ('origin/main', 'main')."""
+    out, _, rc = run_git(git_dir, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD')
+    if rc == 0 and out.strip():
+        ref = out.strip()
+        return ref, ref.split('/', 1)[1]
+    for name in ('main', 'master'):
+        for ref in (f'origin/{name}', name):
+            _, _, rc = run_git(git_dir, 'rev-parse', '--verify', '--quiet', ref)
+            if rc == 0:
+                return ref, name
+    cur = get_branch(git_dir)
+    return cur, cur
+
+
+def get_pull_requests(git_dir, token):
+    """
+    Return {head_branch_name: (number, state)} for PRs on the github.com origin.
+    state is 'open', 'merged', or 'closed'. Uses the GitHub API when a token is
+    available, else the gh CLI, else the unauthenticated API (public repos).
+    Returns None if the remote isn't on GitHub or PRs couldn't be fetched.
+    """
+    gh = parse_github_remote(get_remote_url(git_dir))
+    if not gh:
+        return None
+    owner, repo = gh
+    prs = []   # (branch, head_owner, number, state)
+
+    def _from_api():
+        items = _github_list_all(f'https://api.github.com/repos/{owner}/{repo}/pulls?state=all', token)
+        for p in items:
+            head = p.get('head') or {}
+            head_owner = ((head.get('repo') or {}).get('owner') or {}).get('login')
+            state = 'merged' if p.get('merged_at') else p.get('state', '')
+            prs.append((head.get('ref'), head_owner, p['number'], state))
+
+    def _from_gh():
+        result = subprocess.run(
+            ['gh', 'pr', 'list', '--repo', f'{owner}/{repo}', '--state', 'all', '--limit', '1000',
+             '--json', 'number,state,headRefName,headRepositoryOwner'],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip())
+        for p in json.loads(result.stdout or '[]'):
+            head_owner = (p.get('headRepositoryOwner') or {}).get('login')
+            prs.append((p['headRefName'], head_owner, p['number'], p['state'].lower()))
+
+    try:
+        if token:
+            _from_api()
+        else:
+            try:
+                _from_gh()
+            except (FileNotFoundError, RuntimeError, ValueError):
+                prs.clear()
+                _from_api()
+    except (RuntimeError, ValueError) as e:
+        print(f"  WARNING  {git_dir}  (could not fetch pull requests: {e})", file=sys.stderr)
+        return None
+
+    # Prefer open > merged > closed, then the newest PR number.
+    rank = {'open': 2, 'merged': 1, 'closed': 0}
+    result = {}
+    for branch, head_owner, number, state in prs:
+        if not branch or (head_owner and head_owner.lower() != owner.lower()):
+            continue   # skip PRs from forks
+        best = result.get(branch)
+        if best is None or (rank.get(state, -1), number) > (rank.get(best[1], -1), best[0]):
+            result[branch] = (number, state)
+    return result
+
+
+def _branch_state(name, ref, is_current, default_name, default_ref, git_dir, prs):
+    """Return (state_text, color) - one mutually exclusive merge/PR/delete state."""
+    if name == default_name:
+        return 'default', None
+    if is_current:
+        return 'checked out', _YELLOW
+    pr = prs.get(name) if prs else None
+    if pr and pr[1] == 'open':
+        return f'PR #{pr[0]} open', _YELLOW
+    _, _, rc = run_git(git_dir, 'merge-base', '--is-ancestor', ref, default_ref)
+    if rc == 0:
+        return 'merged - safe to delete', _GREEN
+    if pr and pr[1] == 'merged':
+        return f'PR #{pr[0]} merged - safe to delete', _GREEN
+    ahead_out, _, _ = run_git(git_dir, 'rev-list', '--count', f'{default_ref}..{ref}')
+    ahead = ahead_out.strip() or '?'
+    if pr and pr[1] == 'closed':
+        return f'PR #{pr[0]} closed, unmerged (+{ahead})', _RED
+    return f'unmerged (+{ahead})', _RED
+
+
+def cmd_branch_details(git_dirs, args):
+    """Report owner, last-change date, and merged/PR/safe-to-delete state of every branch."""
+    token = args.token or os.environ.get('GITHUB_TOKEN')
+
+    for d in git_dirs:
+        remote_out, _, _ = run_git(d, 'remote')
+        if remote_out.strip():
+            _, stderr, rc = run_git(d, 'fetch', '--all', '--prune', '--quiet')
+            if rc != 0:
+                print(f"  WARNING  {d}  (fetch --all --prune failed: {stderr.strip()})",
+                      file=sys.stderr)
+
+        default_ref, default_name = get_default_branch(d)
+        current = get_branch(d)
+        prs = get_pull_requests(d, token) if remote_out.strip() else None
+
+        refs_out, _, _ = run_git(
+            d, 'for-each-ref', '--sort=-committerdate',
+            '--format=%(refname)\t%(refname:short)\t%(committerdate:short)\t%(authorname)',
+            'refs/heads', 'refs/remotes')
+
+        rows = []
+        for line in refs_out.splitlines():
+            parts = line.split('\t')
+            if len(parts) != 4:
+                continue
+            full, short, date, tip_author = parts
+            if full.endswith('/HEAD'):
+                continue
+            is_remote = full.startswith('refs/remotes/')
+            name = short.split('/', 1)[1] if is_remote and '/' in short else short
+            # Owner: author of the oldest commit unique to this branch, else the tip author.
+            owner = tip_author
+            if name != default_name:
+                log_out, _, _ = run_git(d, 'log', '--reverse', '--format=%an', f'{default_ref}..{full}')
+                first = log_out.split('\n', 1)[0].strip()
+                if first:
+                    owner = first
+            state, color = _branch_state(name, full, (not is_remote and short == current),
+                                         default_name, default_ref, d, prs)
+            rows.append(('remote' if is_remote else 'local', short, owner, date, state, color))
+
+        rows.sort(key=lambda r: (r[0] != 'local',))   # local first; date order kept within
+
+        print(f"branches  {d}  (default: {default_ref}"
+              + ('' if prs is not None else ', PR info unavailable') + ')')
+        if not rows:
+            print("(no branches)\n")
+            continue
+        headers = ('WHERE', 'BRANCH', 'OWNER', 'LAST CHANGE', 'STATE')
+        widths = [max(len(headers[i]), *(len(r[i]) for r in rows)) for i in range(4)]
+        fmt = '  '.join(f'{{:<{w}}}' for w in widths)
+        print(fmt.format(*headers[:4]) + '  ' + headers[4])
+        print('-' * (sum(widths) + 2 * 4 + max(len(headers[4]), *(len(r[4]) for r in rows))))
+        for where, short, owner, date, state, color in rows:
+            print(fmt.format(where, short, owner, date) + '  ' + (_c(state, color) if color else state))
+        print()
+
+
+# ---------------------------------------------------------------------------
 # --pull command
 # ---------------------------------------------------------------------------
 
@@ -1532,6 +1697,10 @@ def main():
   git-tool.py --tag-list .
   git-tool.py --tag-list --tag-file app/build.gradle --tag-text ext.PLUGIN_VERSION .
 
+  # Every local + remote branch: owner, last change, merged/PR/safe-to-delete state:
+  git-tool.py --branch-details .
+  git-tool.py --branch-details --token ghp_xxx .
+
   # Fetch, prune, and gc all repos:
   git-tool.py --clean ~/projects
   git-tool.py --clean --dry-run ~/projects
@@ -1632,6 +1801,14 @@ Notes:
         '--tag-list', action='store_true',
         help='List all tags (newest first) with date and the --tag-text line found '
              'in --tag-file at that tag',
+    )
+    parser.add_argument(
+        '--branch-details', action='store_true',
+        help='List every local and remote branch with owner, last-change date, and\n'
+             'one state column: default / checked out / PR open / merged - safe to delete /\n'
+             'PR merged - safe to delete / PR closed, unmerged / unmerged (+N ahead).\n'
+             'Runs "git fetch --all --prune" first. PR info (github.com only) uses\n'
+             '--token/GITHUB_TOKEN, else the gh CLI, else the public API',
     )
     parser.add_argument(
         '--tag-file', metavar='FILE', default='app/build.gradle',
@@ -1741,8 +1918,8 @@ Notes:
     if args.recursive or args.include or args.exclude or args.output:
         parser.error("--recursive, --include, --exclude, and --output require --download")
 
-    if args.token:
-        parser.error("--token requires --download, --repo-list, or --repo-clone")
+    if args.token and not args.branch_details:
+        parser.error("--token requires --download, --repo-list, --repo-clone, or --branch-details")
 
     # Merge --dir and trailing positional dirs into one list; default to cwd
     all_dirs = args.dir + args.dirs or ['.']
@@ -1753,9 +1930,9 @@ Notes:
 
     reporting = args.branch or args.status or args.tag or args.release or args.size or args.dirty
     if not reporting and not args.main and not args.delete_branch and not args.clean \
-            and not args.pull and not args.push and not args.tag_list:
+            and not args.pull and not args.push and not args.tag_list and not args.branch_details:
         parser.error("specify at least one of --branch, --status, --tag, --release, "
-                     "--size, --summary, --dirty, --tag-list, --main, --delete-branch, "
+                     "--size, --summary, --dirty, --tag-list, --branch-details, --main, --delete-branch, "
                      "--clean, --pull, or --push")
 
     if args.dry_run and not (args.main or args.delete_branch or args.clean or args.pull or args.push):
@@ -1782,6 +1959,8 @@ Notes:
             report_repos(git_dirs, args, collector)
         if args.tag_list:
             cmd_tag_list(git_dirs, args)
+        if args.branch_details:
+            cmd_branch_details(git_dirs, args)
         if args.main:
             cmd_rename_to_main(git_dirs, args)
         if args.delete_branch:
