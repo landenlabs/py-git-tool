@@ -48,8 +48,8 @@ _(coming soon)_
   - `--dirty` — suppress clean repos; show only repos with pending changes or errors.
   - `--branch-details` — every local and remote branch in columns: owner (author of the
     branch's first unique commit), last-change date, and one state column —
-    `default`, `checked out`, `PR #N open`, `merged - safe to delete`,
-    `PR #N merged - safe to delete` (squash merges), `PR #N closed, unmerged (+N)`, or
+    `default`, `checked out`, `PR #N open -> BASE`, `merged - safe to delete`,
+    `PR #N merged -> BASE - safe to delete` (squash merges), `PR #N closed (-> BASE), unmerged (+N)`, or
     `unmerged (+N)`. PR info is github.com only and uses `--token`/`GITHUB_TOKEN`,
     else the `gh` CLI, else the public API.
 - **ANSI color output.** Red = error, yellow = behind remote, green = local changes.

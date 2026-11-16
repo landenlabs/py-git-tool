@@ -1297,7 +1297,7 @@ def get_default_branch(git_dir):
 
 def get_pull_requests(git_dir, token):
     """
-    Return {head_branch_name: (number, state)} for PRs on the github.com origin.
+    Return {head_branch_name: (number, state, base_branch)} for PRs on the github.com origin.
     state is 'open', 'merged', or 'closed'. Uses the GitHub API when a token is
     available, else the gh CLI, else the unauthenticated API (public repos).
     Returns None if the remote isn't on GitHub or PRs couldn't be fetched.
@@ -1306,7 +1306,7 @@ def get_pull_requests(git_dir, token):
     if not gh:
         return None
     owner, repo = gh
-    prs = []   # (branch, head_owner, number, state)
+    prs = []   # (branch, head_owner, number, state, base_branch)
 
     def _from_api():
         items = _github_list_all(f'https://api.github.com/repos/{owner}/{repo}/pulls?state=all', token)
@@ -1314,18 +1314,20 @@ def get_pull_requests(git_dir, token):
             head = p.get('head') or {}
             head_owner = ((head.get('repo') or {}).get('owner') or {}).get('login')
             state = 'merged' if p.get('merged_at') else p.get('state', '')
-            prs.append((head.get('ref'), head_owner, p['number'], state))
+            prs.append((head.get('ref'), head_owner, p['number'], state,
+                        (p.get('base') or {}).get('ref', '?')))
 
     def _from_gh():
         result = subprocess.run(
             ['gh', 'pr', 'list', '--repo', f'{owner}/{repo}', '--state', 'all', '--limit', '1000',
-             '--json', 'number,state,headRefName,headRepositoryOwner'],
+             '--json', 'number,state,headRefName,headRepositoryOwner,baseRefName'],
             capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip())
         for p in json.loads(result.stdout or '[]'):
             head_owner = (p.get('headRepositoryOwner') or {}).get('login')
-            prs.append((p['headRefName'], head_owner, p['number'], p['state'].lower()))
+            prs.append((p['headRefName'], head_owner, p['number'], p['state'].lower(),
+                        p.get('baseRefName') or '?'))
 
     try:
         if token:
@@ -1343,12 +1345,12 @@ def get_pull_requests(git_dir, token):
     # Prefer open > merged > closed, then the newest PR number.
     rank = {'open': 2, 'merged': 1, 'closed': 0}
     result = {}
-    for branch, head_owner, number, state in prs:
+    for branch, head_owner, number, state, base in prs:
         if not branch or (head_owner and head_owner.lower() != owner.lower()):
             continue   # skip PRs from forks
         best = result.get(branch)
         if best is None or (rank.get(state, -1), number) > (rank.get(best[1], -1), best[0]):
-            result[branch] = (number, state)
+            result[branch] = (number, state, base)
     return result
 
 
@@ -1360,16 +1362,16 @@ def _branch_state(name, ref, is_current, default_name, default_ref, git_dir, prs
         return 'checked out', _YELLOW
     pr = prs.get(name) if prs else None
     if pr and pr[1] == 'open':
-        return f'PR #{pr[0]} open', _YELLOW
+        return f'PR #{pr[0]} open -> {pr[2]}', _YELLOW
     _, _, rc = run_git(git_dir, 'merge-base', '--is-ancestor', ref, default_ref)
     if rc == 0:
         return 'merged - safe to delete', _GREEN
     if pr and pr[1] == 'merged':
-        return f'PR #{pr[0]} merged - safe to delete', _GREEN
+        return f'PR #{pr[0]} merged -> {pr[2]} - safe to delete', _GREEN
     ahead_out, _, _ = run_git(git_dir, 'rev-list', '--count', f'{default_ref}..{ref}')
     ahead = ahead_out.strip() or '?'
     if pr and pr[1] == 'closed':
-        return f'PR #{pr[0]} closed, unmerged (+{ahead})', _RED
+        return f'PR #{pr[0]} closed (-> {pr[2]}), unmerged (+{ahead})', _RED
     return f'unmerged (+{ahead})', _RED
 
 
@@ -1805,8 +1807,8 @@ Notes:
     parser.add_argument(
         '--branch-details', action='store_true',
         help='List every local and remote branch with owner, last-change date, and\n'
-             'one state column: default / checked out / PR open / merged - safe to delete /\n'
-             'PR merged - safe to delete / PR closed, unmerged / unmerged (+N ahead).\n'
+             'one state column: default / checked out / PR open -> BASE / merged - safe to delete /\n'
+             'PR merged -> BASE - safe to delete / PR closed (-> BASE), unmerged / unmerged (+N ahead).\n'
              'Runs "git fetch --all --prune" first. PR info (github.com only) uses\n'
              '--token/GITHUB_TOKEN, else the gh CLI, else the public API',
     )
