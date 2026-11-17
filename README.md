@@ -53,6 +53,10 @@ _(coming soon)_
     `unmerged (+N)`. PR info is github.com only and uses `--token`/`GITHUB_TOKEN`,
     else the `gh` CLI, else the public API. Repos and per-branch lookups run in
     parallel; `--jobs N` (default 8) sets the worker count.
+- **GitHub Actions cleanup.** `--actions-delete-runs-keep [N]` deletes all but the newest
+  `N` (default 3) Actions runs of every workflow in each github.com repo. In-progress runs
+  are never deleted. Prompts per repo, honors `--dry-run`, deletes in parallel (`--jobs N`).
+  Uses `--token`/`GITHUB_TOKEN`, else the `gh` CLI.
 - **ANSI color output.** Red = error, yellow = behind remote, green = local changes.
   Respects `NO_COLOR` and `--no-color`. Windows virtual terminal processing is enabled
   automatically.
@@ -174,6 +178,13 @@ git-tool.py --main ~/projects
 git-tool.py --branch-details .
 git-tool.py --branch-details --token ghp_xxx ~/projects
 git-tool.py --branch-details --jobs 16 ~/projects
+```
+
+### Delete old GitHub Actions runs (keep newest N per workflow)
+
+```bash
+git-tool.py --actions-delete-runs-keep 3 --dry-run .
+git-tool.py --actions-delete-runs-keep 3 ~/projects
 ```
 
 ### Search by regex pattern

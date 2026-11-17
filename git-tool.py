@@ -1497,6 +1497,135 @@ def cmd_branch_details(git_dirs, args):
 
 
 # ---------------------------------------------------------------------------
+# --actions-delete-runs-keep command
+# ---------------------------------------------------------------------------
+
+def _list_workflow_runs(owner, repo, token):
+    """
+    Return every GitHub Actions run for owner/repo as dicts with keys
+    id, workflow_id, name, status, created_at. Uses the REST API when a token
+    is given, else the gh CLI (which carries its own auth).
+    """
+    path = f'repos/{owner}/{repo}/actions/runs'
+    keys = ('id', 'workflow_id', 'name', 'status', 'created_at')
+    if token:
+        runs = []
+        page = 1
+        while True:
+            data = github_api_get(f'https://api.github.com/{path}?per_page=100&page={page}', token)
+            batch = data.get('workflow_runs') or []
+            runs.extend({k: r.get(k) for k in keys} for r in batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return runs
+
+    result = subprocess.run(
+        ['gh', 'api', '--paginate', f'{path}?per_page=100',
+         '--jq', '.workflow_runs[] | {id, workflow_id, name, status, created_at}'],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or 'gh api failed')
+    return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def _delete_workflow_run(owner, repo, run_id, token):
+    """Delete one Actions run. Returns None on success, else an error string."""
+    path = f'repos/{owner}/{repo}/actions/runs/{run_id}'
+    if token:
+        req = urllib.request.Request(f'https://api.github.com/{path}',
+                                     headers=_github_headers(token), method='DELETE')
+        try:
+            with _urlopen_with_retry(req):
+                return None
+        except urllib.error.HTTPError as e:
+            return f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace').strip()}"
+        except urllib.error.URLError as e:
+            return f"network error: {e.reason}"
+    result = subprocess.run(['gh', 'api', '-X', 'DELETE', path], capture_output=True, text=True)
+    return None if result.returncode == 0 else (result.stderr.strip() or 'gh api failed')
+
+
+def cmd_actions_delete_runs(git_dirs, args):
+    """Per github.com repo, delete all but the newest N Actions runs of each workflow."""
+    keep = args.actions_delete_runs_keep
+    token = args.token or os.environ.get('GITHUB_TOKEN')
+    dry = args.dry_run
+    total_deleted = total_errors = 0
+
+    for d in git_dirs:
+        gh = parse_github_remote(get_remote_url(d))
+        if not gh:
+            if args.verbose:
+                print(f"  skip  {d}  (origin is not a github.com remote)")
+            continue
+        owner, repo = gh
+        try:
+            runs = _list_workflow_runs(owner, repo, token)
+        except FileNotFoundError:
+            print("ERROR: gh CLI not found; install it or pass --token/GITHUB_TOKEN", file=sys.stderr)
+            return
+        except (RuntimeError, ValueError) as e:
+            print(f"  WARNING  {d}  (could not list workflow runs: {e})", file=sys.stderr)
+            continue
+
+        # Group per workflow, newest first; keep the first N of each.
+        groups = {}
+        for r in runs:
+            groups.setdefault(r.get('workflow_id') or r.get('name'), []).append(r)
+        doomed = []
+        lines = []
+        for wf_runs in sorted(groups.values(), key=lambda g: (g[0].get('name') or '').lower()):
+            wf_runs.sort(key=lambda r: r.get('created_at') or '', reverse=True)
+            old = [r for r in wf_runs[keep:] if r.get('status') == 'completed']
+            active = len(wf_runs[keep:]) - len(old)
+            note = f", {active} still running (kept)" if active else ''
+            lines.append(f"  {wf_runs[0].get('name') or '?':<40} {len(wf_runs):>5} runs, "
+                         f"delete {len(old)}{note}")
+            doomed.extend(old)
+
+        if not doomed:
+            if args.verbose:
+                print(f"{d}  ({owner}/{repo})\n  nothing to delete (keeping {keep} per workflow)\n")
+            continue
+
+        print(f"{d}  ({owner}/{repo})")
+        for line in lines:
+            print(line)
+
+        if dry:
+            print(f"  [dry-run] would delete {len(doomed)} run(s), keeping newest {keep} per workflow")
+            print()
+            total_deleted += len(doomed)
+            continue
+
+        reply = input(f"  Delete {len(doomed)} run(s), keeping newest {keep} per workflow? [y/N] ")
+        if reply.strip().lower() != 'y':
+            print("  skipped\n")
+            continue
+
+        deleted = errors = 0
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            futures = [(r, pool.submit(_delete_workflow_run, owner, repo, r['id'], token))
+                       for r in doomed]
+            for r, f in futures:
+                err = f.result()
+                if err:
+                    errors += 1
+                    print(f"  ERROR deleting run {r['id']} ({r.get('name')}): {err}", file=sys.stderr)
+                else:
+                    deleted += 1
+        print(f"  deleted {deleted} run(s){f', {errors} error(s)' if errors else ''}\n")
+        total_deleted += deleted
+        total_errors += errors
+
+    if dry:
+        print(f"Would delete {total_deleted} workflow run(s).")
+    else:
+        print(f"Deleted {total_deleted} workflow run(s); {total_errors} errors.")
+
+
+# ---------------------------------------------------------------------------
 # --pull command
 # ---------------------------------------------------------------------------
 
@@ -1766,6 +1895,10 @@ def main():
   git-tool.py --branch-details --token ghp_xxx .
   git-tool.py --branch-details --jobs 16 ~/projects
 
+  # Delete all but the newest N GitHub Actions runs per workflow (default 3):
+  git-tool.py --actions-delete-runs-keep 3 --dry-run .
+  git-tool.py --actions-delete-runs-keep 3 ~/projects
+
   # Fetch, prune, and gc all repos:
   git-tool.py --clean ~/projects
   git-tool.py --clean --dry-run ~/projects
@@ -1876,9 +2009,15 @@ Notes:
              '--token/GITHUB_TOKEN, else the gh CLI, else the public API',
     )
     parser.add_argument(
+        '--actions-delete-runs-keep', nargs='?', type=int, const=3, default=None, metavar='N',
+        help='For each github.com repo, delete all but the newest N GitHub Actions runs\n'
+             'of every workflow (default N: 3; in-progress runs are never deleted).\n'
+             'Prompts per repo; honors --dry-run. Uses --token/GITHUB_TOKEN, else the gh CLI',
+    )
+    parser.add_argument(
         '--jobs', '-j', type=int, default=8, metavar='N',
-        help='Parallel workers for --branch-details (repos and per-branch git calls; '
-             'default: %(default)s)',
+        help='Parallel workers for --branch-details and --actions-delete-runs-keep '
+             '(default: %(default)s)',
     )
     parser.add_argument(
         '--tag-file', metavar='FILE', default='app/build.gradle',
@@ -1988,8 +2127,13 @@ Notes:
     if args.recursive or args.include or args.exclude or args.output:
         parser.error("--recursive, --include, --exclude, and --output require --download")
 
-    if args.token and not args.branch_details:
-        parser.error("--token requires --download, --repo-list, --repo-clone, or --branch-details")
+    deleting_runs = args.actions_delete_runs_keep is not None
+    if deleting_runs and args.actions_delete_runs_keep < 0:
+        parser.error("--actions-delete-runs-keep N must be >= 0")
+
+    if args.token and not (args.branch_details or deleting_runs):
+        parser.error("--token requires --download, --repo-list, --repo-clone, --branch-details, "
+                     "or --actions-delete-runs-keep")
 
     # Merge --dir and trailing positional dirs into one list; default to cwd
     all_dirs = args.dir + args.dirs or ['.']
@@ -2000,13 +2144,16 @@ Notes:
 
     reporting = args.branch or args.status or args.tag or args.release or args.size or args.dirty
     if not reporting and not args.main and not args.delete_branch and not args.clean \
-            and not args.pull and not args.push and not args.tag_list and not args.branch_details:
+            and not args.pull and not args.push and not args.tag_list and not args.branch_details \
+            and not deleting_runs:
         parser.error("specify at least one of --branch, --status, --tag, --release, "
                      "--size, --summary, --dirty, --tag-list, --branch-details, --main, --delete-branch, "
-                     "--clean, --pull, or --push")
+                     "--actions-delete-runs-keep, --clean, --pull, or --push")
 
-    if args.dry_run and not (args.main or args.delete_branch or args.clean or args.pull or args.push):
-        parser.error("--dry-run only applies to --main, --delete-branch, --clean, --pull, or --push")
+    if args.dry_run and not (args.main or args.delete_branch or args.clean or args.pull or args.push
+                             or deleting_runs):
+        parser.error("--dry-run only applies to --main, --delete-branch, --actions-delete-runs-keep, "
+                     "--clean, --pull, or --push")
 
     if args.push and not args.message and not args.dry_run:
         parser.error("--push requires --message")
@@ -2031,6 +2178,8 @@ Notes:
             cmd_tag_list(git_dirs, args)
         if args.branch_details:
             cmd_branch_details(git_dirs, args)
+        if deleting_runs:
+            cmd_actions_delete_runs(git_dirs, args)
         if args.main:
             cmd_rename_to_main(git_dirs, args)
         if args.delete_branch:
