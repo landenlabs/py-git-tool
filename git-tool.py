@@ -1298,8 +1298,8 @@ def get_default_branch(git_dir):
 
 def get_pull_requests(git_dir, token, warnings=None):
     """
-    Return {head_branch_name: (number, state, base_branch)} for PRs on the github.com origin.
-    state is 'open', 'merged', or 'closed'. Uses the GitHub API when a token is
+    Return {head_branch_name: (number, state, base_branch, head_sha)} for PRs on the github.com
+    origin. state is 'open', 'merged', or 'closed'. Uses the GitHub API when a token is
     available, else the gh CLI, else the unauthenticated API (public repos).
     Returns None if the remote isn't on GitHub or PRs couldn't be fetched.
     """
@@ -1307,7 +1307,7 @@ def get_pull_requests(git_dir, token, warnings=None):
     if not gh:
         return None
     owner, repo = gh
-    prs = []   # (branch, head_owner, number, state, base_branch)
+    prs = []   # (branch, head_owner, number, state, base_branch, head_sha)
 
     def _from_api():
         items = _github_list_all(f'https://api.github.com/repos/{owner}/{repo}/pulls?state=all', token)
@@ -1316,19 +1316,19 @@ def get_pull_requests(git_dir, token, warnings=None):
             head_owner = ((head.get('repo') or {}).get('owner') or {}).get('login')
             state = 'merged' if p.get('merged_at') else p.get('state', '')
             prs.append((head.get('ref'), head_owner, p['number'], state,
-                        (p.get('base') or {}).get('ref', '?')))
+                        (p.get('base') or {}).get('ref', '?'), head.get('sha')))
 
     def _from_gh():
         result = subprocess.run(
             ['gh', 'pr', 'list', '--repo', f'{owner}/{repo}', '--state', 'all', '--limit', '1000',
-             '--json', 'number,state,headRefName,headRepositoryOwner,baseRefName'],
+             '--json', 'number,state,headRefName,headRepositoryOwner,baseRefName,headRefOid'],
             capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip())
         for p in json.loads(result.stdout or '[]'):
             head_owner = (p.get('headRepositoryOwner') or {}).get('login')
             prs.append((p['headRefName'], head_owner, p['number'], p['state'].lower(),
-                        p.get('baseRefName') or '?'))
+                        p.get('baseRefName') or '?', p.get('headRefOid')))
 
     try:
         if token:
@@ -1350,12 +1350,12 @@ def get_pull_requests(git_dir, token, warnings=None):
     # Prefer open > merged > closed, then the newest PR number.
     rank = {'open': 2, 'merged': 1, 'closed': 0}
     result = {}
-    for branch, head_owner, number, state, base in prs:
+    for branch, head_owner, number, state, base, head_sha in prs:
         if not branch or (head_owner and head_owner.lower() != owner.lower()):
             continue   # skip PRs from forks
         best = result.get(branch)
         if best is None or (rank.get(state, -1), number) > (rank.get(best[1], -1), best[0]):
-            result[branch] = (number, state, base)
+            result[branch] = (number, state, base, head_sha)
     return result
 
 
@@ -1494,6 +1494,163 @@ def cmd_branch_details(git_dirs, args):
     finally:
         repo_pool.shutdown(wait=False, cancel_futures=True)
         work_pool.shutdown(wait=False, cancel_futures=True)
+
+
+# ---------------------------------------------------------------------------
+# --delete-merged command
+# ---------------------------------------------------------------------------
+
+# Branch names never deleted by --delete-merged, whatever their merge state.
+PROTECTED_BRANCHES = ('main', 'master', 'develop', 'development', 'release', 'release/*')
+
+
+def _worktree_branches(git_dir):
+    """Return the set of local branch names checked out in any worktree."""
+    out, _, _ = run_git(git_dir, 'worktree', 'list', '--porcelain')
+    prefix = 'branch refs/heads/'
+    return {line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)}
+
+
+def _merged_candidates(d, pattern, include_pr, token, warnings):
+    """
+    Find merged branches in one repo.
+    Returns (default_ref, {name: {'local': reason|None, 'remote': reason|None}}, protected_hits)
+    or (None, None, reason_skipped).
+    """
+    default_ref, default_name = get_default_branch(d)
+    current = get_branch(d)
+    _, _, rc = run_git(d, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/HEAD')
+    if rc != 0 and default_name not in ('main', 'master'):
+        return None, None, 'cannot determine the default branch'
+
+    keep = {default_name, current} | _worktree_branches(d)
+
+    out, _, _ = run_git(d, 'for-each-ref', '--format=%(refname)\t%(objectname)',
+                        'refs/heads', 'refs/remotes/origin')
+    merged_out, _, _ = run_git(d, 'for-each-ref', '--format=%(refname)',
+                               f'--merged={default_ref}', 'refs/heads', 'refs/remotes/origin')
+    merged = set(merged_out.split())
+
+    prs = None
+    if include_pr:
+        prs = get_pull_requests(d, token, warnings)
+        if prs is None:
+            warnings.append(f"  WARNING  {d}  (PR info unavailable; only git-merged branches considered)")
+
+    candidates = {}
+    protected_hits = set()
+    for line in out.splitlines():
+        full, _, sha = line.partition('\t')
+        if full.startswith('refs/heads/'):
+            where, name = 'local', full[len('refs/heads/'):]
+        else:
+            where, name = 'remote', full[len('refs/remotes/origin/'):]
+        if name == 'HEAD' or not fnmatch.fnmatchcase(name, pattern):
+            continue
+
+        reason = None
+        if full in merged:
+            reason = f'merged into {default_ref}'
+        elif prs and name in prs and prs[name][1] == 'merged' and prs[name][3]:
+            number, _, base, pr_sha = prs[name]
+            # Only if this ref has no commits beyond what the PR merged.
+            if sha == pr_sha or run_git(d, 'merge-base', '--is-ancestor', sha, pr_sha)[2] == 0:
+                reason = f'PR #{number} merged -> {base}'
+        if reason is None:
+            continue
+
+        if name in keep or any(fnmatch.fnmatchcase(name, p) for p in PROTECTED_BRANCHES):
+            protected_hits.add(name)
+            continue
+        candidates.setdefault(name, {'local': None, 'remote': None})[where] = reason
+
+    return default_ref, candidates, protected_hits
+
+
+def cmd_delete_merged(git_dirs, args):
+    """Delete every local and origin branch already merged into the default branch."""
+    pattern = args.match
+    dry = args.dry_run
+    token = args.token or os.environ.get('GITHUB_TOKEN')
+    total_deleted = total_errors = 0
+
+    for d in git_dirs:
+        remote_out, _, _ = run_git(d, 'remote')
+        has_origin = 'origin' in remote_out.split()
+        if has_origin:
+            _, stderr, rc = run_git(d, 'fetch', '--all', '--prune', '--quiet')
+            if rc != 0:
+                print(f"  WARNING  {d}  (fetch --all --prune failed: {stderr.strip()})", file=sys.stderr)
+
+        warnings = []
+        default_ref, candidates, info = _merged_candidates(
+            d, pattern, args.include_pr_merged and has_origin, token, warnings)
+        for w in warnings:
+            print(w, file=sys.stderr)
+        if candidates is None:
+            print(f"  skip  {d}  ({info})")
+            continue
+        if not candidates:
+            if args.verbose:
+                print(f"{d}\n  no merged branches to delete\n")
+            continue
+
+        locals_  = sorted(n for n, c in candidates.items() if c['local'])
+        remotes_ = sorted(n for n, c in candidates.items() if c['remote'])
+
+        print(f"{d}  (default: {default_ref})")
+        width = max(len(n) for n in candidates)
+        for name in sorted(candidates):
+            c = candidates[name]
+            where = '+'.join(w for w in ('local', 'remote') if c[w])
+            reason = c['local'] or c['remote']
+            print(f"  {name:<{width}}  {where:<12}  {_c(reason, _GREEN)}")
+        if info and args.verbose:
+            print(f"  protected (not deleted): {', '.join(sorted(info))}")
+
+        summary = f"{len(locals_)} local + {len(remotes_)} remote branch(es)"
+        if dry:
+            print(f"  [dry-run] would delete {summary}\n")
+            total_deleted += len(locals_) + len(remotes_)
+            continue
+
+        if not args.yes:
+            reply = input(f"  Delete {summary}? [y/N] ").strip().lower()
+            if reply != 'y':
+                print("  skipped\n")
+                continue
+
+        deleted = errors = 0
+        for name in locals_:
+            _, stderr, rc = run_git(d, 'branch', '-D', name)
+            if rc != 0:
+                print(f"  ERROR (local delete {name}): {stderr.strip()}", file=sys.stderr)
+                errors += 1
+            else:
+                deleted += 1
+
+        if remotes_:
+            # One push for all; on failure retry one at a time to pinpoint which failed.
+            _, _, rc = run_git(d, 'push', 'origin', '--delete', *remotes_)
+            if rc == 0:
+                deleted += len(remotes_)
+            else:
+                for name in remotes_:
+                    _, stderr, rc = run_git(d, 'push', 'origin', '--delete', name)
+                    if rc != 0:
+                        print(f"  ERROR (remote delete {name}): {stderr.strip()}", file=sys.stderr)
+                        errors += 1
+                    else:
+                        deleted += 1
+
+        print(f"  deleted {deleted} branch ref(s)" + (f", {errors} error(s)" if errors else '') + "\n")
+        total_deleted += deleted
+        total_errors += errors
+
+    if dry:
+        print(f"Would delete {total_deleted} branch ref(s).")
+    else:
+        print(f"Deleted {total_deleted} branch ref(s); {total_errors} error(s).")
 
 
 # ---------------------------------------------------------------------------
@@ -1886,6 +2043,14 @@ def main():
   git-tool.py --delete-branch old-feature ~/projects
   git-tool.py --delete-branch old-feature --dry-run ~/projects
 
+  # Delete every branch already merged into the default branch (local + origin;
+  # one prompt per repo; default/current/protected branches are never touched):
+  git-tool.py --delete-merged --dry-run ~/projects
+  git-tool.py --delete-merged ~/projects
+  git-tool.py --delete-merged --match "feature/*" --yes ~/projects
+  # Also catch squash/rebase-merged GitHub PRs (only if no commits since the PR):
+  git-tool.py --delete-merged --include-pr-merged --dry-run .
+
   # List every tag with its date and a version line from a file at that tag:
   git-tool.py --tag-list .
   git-tool.py --tag-list --tag-file app/build.gradle --tag-text ext.PLUGIN_VERSION .
@@ -1996,6 +2161,28 @@ Notes:
              'showing merge status); runs "git fetch --all --prune" first',
     )
     parser.add_argument(
+        '--delete-merged', action='store_true',
+        help='Delete every local and origin branch already merged into the default branch.\n'
+             'Never deletes the default, checked-out, worktree, or protected branches\n'
+             '(main, master, develop, development, release, release/*). Prompts once per\n'
+             'repo; honors --dry-run. Runs "git fetch --all --prune" first',
+    )
+    parser.add_argument(
+        '--match', metavar='GLOB', default='*',
+        help='With --delete-merged, only consider branches whose name matches GLOB\n'
+             '(e.g. "feature/*"; quote it so the shell does not expand it)',
+    )
+    parser.add_argument(
+        '--include-pr-merged', action='store_true',
+        help='With --delete-merged, also delete branches whose GitHub PR was merged\n'
+             '(squash/rebase merges), but only if the branch has no commits beyond the PR.\n'
+             'Uses --token/GITHUB_TOKEN, else the gh CLI, else the public API',
+    )
+    parser.add_argument(
+        '--yes', '-y', action='store_true',
+        help='With --delete-merged, delete without prompting',
+    )
+    parser.add_argument(
         '--tag-list', action='store_true',
         help='List all tags (newest first) with date and the --tag-text line found '
              'in --tag-file at that tag',
@@ -2045,7 +2232,7 @@ Notes:
     )
     parser.add_argument(
         '--dry-run', action='store_true',
-        help='Preview what --main, --delete-branch, --clean, --pull, or --push '
+        help='Preview what --main, --delete-branch, --delete-merged, --clean, --pull, or --push '
              'would do without making changes',
     )
     parser.add_argument(
@@ -2131,9 +2318,12 @@ Notes:
     if deleting_runs and args.actions_delete_runs_keep < 0:
         parser.error("--actions-delete-runs-keep N must be >= 0")
 
-    if args.token and not (args.branch_details or deleting_runs):
+    if args.token and not (args.branch_details or deleting_runs or args.delete_merged):
         parser.error("--token requires --download, --repo-list, --repo-clone, --branch-details, "
-                     "or --actions-delete-runs-keep")
+                     "--delete-merged, or --actions-delete-runs-keep")
+
+    if not args.delete_merged and (args.match != '*' or args.include_pr_merged or args.yes):
+        parser.error("--match, --include-pr-merged, and --yes require --delete-merged")
 
     # Merge --dir and trailing positional dirs into one list; default to cwd
     all_dirs = args.dir + args.dirs or ['.']
@@ -2143,17 +2333,17 @@ Notes:
         args.branch = args.status = args.tag = args.release = args.size = True
 
     reporting = args.branch or args.status or args.tag or args.release or args.size or args.dirty
-    if not reporting and not args.main and not args.delete_branch and not args.clean \
-            and not args.pull and not args.push and not args.tag_list and not args.branch_details \
-            and not deleting_runs:
+    if not reporting and not args.main and not args.delete_branch and not args.delete_merged \
+            and not args.clean and not args.pull and not args.push and not args.tag_list \
+            and not args.branch_details and not deleting_runs:
         parser.error("specify at least one of --branch, --status, --tag, --release, "
                      "--size, --summary, --dirty, --tag-list, --branch-details, --main, --delete-branch, "
-                     "--actions-delete-runs-keep, --clean, --pull, or --push")
+                     "--delete-merged, --actions-delete-runs-keep, --clean, --pull, or --push")
 
-    if args.dry_run and not (args.main or args.delete_branch or args.clean or args.pull or args.push
-                             or deleting_runs):
-        parser.error("--dry-run only applies to --main, --delete-branch, --actions-delete-runs-keep, "
-                     "--clean, --pull, or --push")
+    if args.dry_run and not (args.main or args.delete_branch or args.delete_merged or args.clean
+                             or args.pull or args.push or deleting_runs):
+        parser.error("--dry-run only applies to --main, --delete-branch, --delete-merged, "
+                     "--actions-delete-runs-keep, --clean, --pull, or --push")
 
     if args.push and not args.message and not args.dry_run:
         parser.error("--push requires --message")
@@ -2184,6 +2374,8 @@ Notes:
             cmd_rename_to_main(git_dirs, args)
         if args.delete_branch:
             cmd_delete_branch(git_dirs, args)
+        if args.delete_merged:
+            cmd_delete_merged(git_dirs, args)
         if args.clean:
             cmd_clean(git_dirs, args)
         if args.pull:
