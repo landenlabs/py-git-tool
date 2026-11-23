@@ -1511,11 +1511,23 @@ def _worktree_branches(git_dir):
     return {line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)}
 
 
-def _merged_candidates(d, pattern, include_pr, token, warnings):
+def _owner_matches(owner_filter, name, email):
+    """
+    Case-insensitive match of --owner against the author name or email.
+    A filter containing glob characters (* ? [) is a glob; otherwise a substring.
+    """
+    f = owner_filter.lower()
+    fields = (name.lower(), email.lower())
+    if any(ch in f for ch in '*?['):
+        return any(fnmatch.fnmatchcase(v, f) for v in fields)
+    return any(f in v for v in fields)
+
+
+def _merged_candidates(d, pattern, include_pr, token, warnings, local_only=False, owner_filter=None):
     """
     Find merged branches in one repo.
-    Returns (default_ref, {name: {'local': reason|None, 'remote': reason|None}}, protected_hits)
-    or (None, None, reason_skipped).
+    Returns (default_ref, {name: {'local': (reason, owner)|None, 'remote': ...}}, protected_hits)
+    or (None, None, reason_skipped). owner is the author of the branch tip commit.
     """
     default_ref, default_name = get_default_branch(d)
     current = get_branch(d)
@@ -1525,10 +1537,11 @@ def _merged_candidates(d, pattern, include_pr, token, warnings):
 
     keep = {default_name, current} | _worktree_branches(d)
 
-    out, _, _ = run_git(d, 'for-each-ref', '--format=%(refname)\t%(objectname)',
-                        'refs/heads', 'refs/remotes/origin')
+    scopes = ['refs/heads'] if local_only else ['refs/heads', 'refs/remotes/origin']
+    out, _, _ = run_git(d, 'for-each-ref',
+                        '--format=%(refname)\t%(objectname)\t%(authorname)\t%(authoremail)', *scopes)
     merged_out, _, _ = run_git(d, 'for-each-ref', '--format=%(refname)',
-                               f'--merged={default_ref}', 'refs/heads', 'refs/remotes/origin')
+                               f'--merged={default_ref}', *scopes)
     merged = set(merged_out.split())
 
     prs = None
@@ -1540,12 +1553,17 @@ def _merged_candidates(d, pattern, include_pr, token, warnings):
     candidates = {}
     protected_hits = set()
     for line in out.splitlines():
-        full, _, sha = line.partition('\t')
+        parts = line.split('\t')
+        if len(parts) < 4:
+            continue
+        full, sha, author, email = parts[0], parts[1], parts[2], parts[3].strip('<>')
         if full.startswith('refs/heads/'):
             where, name = 'local', full[len('refs/heads/'):]
         else:
             where, name = 'remote', full[len('refs/remotes/origin/'):]
         if name == 'HEAD' or not fnmatch.fnmatchcase(name, pattern):
+            continue
+        if owner_filter and not _owner_matches(owner_filter, author, email):
             continue
 
         reason = None
@@ -1562,7 +1580,7 @@ def _merged_candidates(d, pattern, include_pr, token, warnings):
         if name in keep or any(fnmatch.fnmatchcase(name, p) for p in PROTECTED_BRANCHES):
             protected_hits.add(name)
             continue
-        candidates.setdefault(name, {'local': None, 'remote': None})[where] = reason
+        candidates.setdefault(name, {'local': None, 'remote': None})[where] = (reason, author)
 
     return default_ref, candidates, protected_hits
 
@@ -1578,13 +1596,15 @@ def cmd_delete_merged(git_dirs, args):
         remote_out, _, _ = run_git(d, 'remote')
         has_origin = 'origin' in remote_out.split()
         if has_origin:
+            # Still fetched with --local-only: merged state is judged against origin's default branch.
             _, stderr, rc = run_git(d, 'fetch', '--all', '--prune', '--quiet')
             if rc != 0:
                 print(f"  WARNING  {d}  (fetch --all --prune failed: {stderr.strip()})", file=sys.stderr)
 
         warnings = []
         default_ref, candidates, info = _merged_candidates(
-            d, pattern, args.include_pr_merged and has_origin, token, warnings)
+            d, pattern, args.include_pr_merged and has_origin, token, warnings,
+            local_only=args.local_only, owner_filter=args.owner)
         for w in warnings:
             print(w, file=sys.stderr)
         if candidates is None:
@@ -1599,12 +1619,19 @@ def cmd_delete_merged(git_dirs, args):
         remotes_ = sorted(n for n, c in candidates.items() if c['remote'])
 
         print(f"{d}  (default: {default_ref})")
-        width = max(len(n) for n in candidates)
+        rows = []
         for name in sorted(candidates):
             c = candidates[name]
+            hits = [c[w] for w in ('local', 'remote') if c[w]]
             where = '+'.join(w for w in ('local', 'remote') if c[w])
-            reason = c['local'] or c['remote']
-            print(f"  {name:<{width}}  {where:<12}  {_c(reason, _GREEN)}")
+            owners = ', '.join(dict.fromkeys(owner for _, owner in hits))   # dedupe, keep order
+            rows.append((name, where, owners, hits[0][0]))
+        w_name  = max(len('BRANCH'), *(len(r[0]) for r in rows))
+        w_where = max(len('WHERE'),  *(len(r[1]) for r in rows))
+        w_owner = max(len('OWNER'),  *(len(r[2]) for r in rows))
+        print(f"  {'BRANCH':<{w_name}}  {'WHERE':<{w_where}}  {'OWNER':<{w_owner}}  STATE")
+        for name, where, owners, reason in rows:
+            print(f"  {name:<{w_name}}  {where:<{w_where}}  {owners:<{w_owner}}  {_c(reason, _GREEN)}")
         if info and args.verbose:
             print(f"  protected (not deleted): {', '.join(sorted(info))}")
 
@@ -2048,6 +2075,9 @@ def main():
   git-tool.py --delete-merged --dry-run ~/projects
   git-tool.py --delete-merged ~/projects
   git-tool.py --delete-merged --match "feature/*" --yes ~/projects
+  # Only local branches, only those whose tip author contains "alice" (or a glob):
+  git-tool.py --delete-merged --local-only --owner alice --dry-run ~/projects
+  git-tool.py --delete-merged --owner "*@example.com" --dry-run ~/projects
   # Also catch squash/rebase-merged GitHub PRs (only if no commits since the PR):
   git-tool.py --delete-merged --include-pr-merged --dry-run .
 
@@ -2177,6 +2207,15 @@ Notes:
         help='With --delete-merged, also delete branches whose GitHub PR was merged\n'
              '(squash/rebase merges), but only if the branch has no commits beyond the PR.\n'
              'Uses --token/GITHUB_TOKEN, else the gh CLI, else the public API',
+    )
+    parser.add_argument(
+        '--local-only', action='store_true',
+        help='With --delete-merged, delete only local branches; never touch origin',
+    )
+    parser.add_argument(
+        '--owner', metavar='TEXT_OR_GLOB',
+        help='With --delete-merged, only branches whose tip-commit author name or email\n'
+             'contains TEXT (case-insensitive), or matches GLOB if it has * ? or [',
     )
     parser.add_argument(
         '--yes', '-y', action='store_true',
@@ -2322,8 +2361,10 @@ Notes:
         parser.error("--token requires --download, --repo-list, --repo-clone, --branch-details, "
                      "--delete-merged, or --actions-delete-runs-keep")
 
-    if not args.delete_merged and (args.match != '*' or args.include_pr_merged or args.yes):
-        parser.error("--match, --include-pr-merged, and --yes require --delete-merged")
+    if not args.delete_merged and (args.match != '*' or args.include_pr_merged or args.yes
+                                   or args.local_only or args.owner):
+        parser.error("--match, --include-pr-merged, --local-only, --owner, and --yes "
+                     "require --delete-merged")
 
     # Merge --dir and trailing positional dirs into one list; default to cwd
     all_dirs = args.dir + args.dirs or ['.']
