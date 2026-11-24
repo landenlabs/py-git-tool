@@ -20,8 +20,9 @@
 
 A cross-platform CLI that scans one or more directory trees for git repositories and
 reports their status, branch, tag, release, and disk size — with optional bulk actions
-to clean, pull, push, or rename `master` to `main`. Also supports downloading a single
-file or directory tree directly from a `github.com` URL, without cloning the repo.
+to clean, pull, push, rename `master` to `main`, and delete merged branches. Also lists and
+clones a GitHub user's or org's repos, prunes old GitHub Actions runs, and downloads a
+single file or directory tree directly from a `github.com` URL, without cloning the repo.
 
 **By [LanDen Labs](https://github.com/landenlabs) (2026)**
 
@@ -53,6 +54,31 @@ _(coming soon)_
     `unmerged (+N)`. PR info is github.com only and uses `--token`/`GITHUB_TOKEN`,
     else the `gh` CLI, else the public API. Repos and per-branch lookups run in
     parallel; `--jobs N` (default 8) sets the worker count.
+  - `--tag-list` — every tag, newest first, with its date and the first line containing
+    `--tag-text` (default `ext.PLUGIN_VERSION`) in `--tag-file` (default `app/build.gradle`)
+    at that tag — handy for mapping release tags to app versions.
+- **Merged-branch cleanup.** `--delete-merged` deletes every local and `origin` branch whose
+  tip is already reachable from the default branch (`origin/HEAD`, e.g. `origin/main`).
+  - Never touches the default branch, the checked-out branch, branches checked out in any
+    worktree, or protected names (`main`, `master`, `develop`, `development`, `release`,
+    `release/*`).
+  - One table and one `[y/N]` prompt per repo (`--yes` skips it); honors `--dry-run`.
+    Runs `git fetch --all --prune` first, and remote deletes are batched into one push.
+  - Filters: `--match GLOB` (branch name), `--owner TEXT_OR_GLOB` (tip-commit author
+    name or email; substring, or glob if it has `* ? [`), `--local-only` (never touch origin).
+  - `--include-pr-merged` also catches squash/rebase-merged GitHub PRs, but only when the
+    branch has no commits beyond what the PR merged.
+  - **Merged elsewhere (report only).** After the delete table, a second table lists
+    branches that are *not* delete candidates but whose tip is already contained in another
+    local or origin branch — e.g. a feature branch merged into `dev_1.4` but not yet into
+    `main`. Nothing in this table is deleted. The MERGED INTO column lists long-lived
+    branches (the protected names plus `dev_*`) first and shows at most 3 names plus
+    `+N more`. Fast-forward copies of the same work are skipped: equal tips, the same name
+    on local vs origin, or the same name with a `_main`/`_dev` suffix. It honors `--match`,
+    `--owner` and `--local-only` like the delete list; `--no-merged-elsewhere` hides it.
+- **Single-branch delete.** `--delete-branch BRANCH` deletes one branch locally and on
+  `origin` in every scanned repo, after showing whether it is merged and asking for
+  confirmation. Skips repos where it is checked out; honors `--dry-run`.
 - **GitHub Actions cleanup.** `--actions-delete-runs-keep [N]` deletes all but the newest
   `N` (default 3) Actions runs of every workflow in each github.com repo. In-progress runs
   are never deleted. Prompts per repo, honors `--dry-run`, deletes in parallel (`--jobs N`).
@@ -65,8 +91,9 @@ _(coming soon)_
   - `--pull` — `git pull` on every repo that has a remote.
   - `--push` — `git add --all`, `git commit -m MSG`, `git push` on every repo with changes.
   - `--main` — rename `master` → `main` (local + remote) wherever safe.
-- **Dry-run mode.** `--dry-run` previews what `--main`, `--clean`, `--pull`, or `--push`
-  would do without making any changes.
+- **Dry-run mode.** `--dry-run` previews what `--main`, `--delete-branch`, `--delete-merged`,
+  `--actions-delete-runs-keep`, `--clean`, `--pull`, or `--push` would do without making
+  any changes.
 - **End-of-run summary.** When `--summary` is used, prints a report with total `.git`
   size, largest repo, status counts (clean / error / pending / behind), branch counts,
   tag/release counts, and contributor list.
@@ -77,6 +104,10 @@ _(coming soon)_
   - `--output` sets the local destination; `--token` (or `GITHUB_TOKEN`) authenticates
     for private repos or a higher API rate limit.
   - Transient network errors are retried automatically with backoff.
+- **GitHub repo listing and cloning.** `--host OWNER` (or `github.com/OWNER`) with
+  `--repo-list [REGEX]` lists a user's or org's repos, flagged `private`/`fork`/`archived`;
+  `--repo-clone REGEX` (repeatable) clones every matching repo into the current directory,
+  skipping names that already exist. Both use `--token`/`GITHUB_TOKEN` for private repos.
 - **Standard CLI.** `--version`, `--help` with examples, clean Ctrl-C handling.
 
 ---
@@ -172,6 +203,54 @@ git-tool.py --main --dry-run ~/projects
 git-tool.py --main ~/projects
 ```
 
+### Delete merged branches
+
+```bash
+git-tool.py --delete-merged --dry-run ~/projects
+git-tool.py --delete-merged ~/projects
+git-tool.py --delete-merged --match "feature/*" --yes ~/projects
+git-tool.py --delete-merged --local-only --owner alice --dry-run ~/projects
+git-tool.py --delete-merged --owner "*@example.com" --dry-run ~/projects
+git-tool.py --delete-merged --include-pr-merged --dry-run .
+git-tool.py --delete-merged --dry-run --no-merged-elsewhere ~/projects
+```
+
+Sample output (`--dry-run`):
+
+```
+/home/you/projects/app  (default: origin/main)
+  BRANCH          WHERE         OWNER  STATE
+  DB-2036_alerts  remote        Alice  merged into origin/main
+  dev_1.3         local+remote  Bob    merged into origin/main
+
+  Merged elsewhere (not deleted)
+  BRANCH                  WHERE   OWNER  MERGED INTO
+  DB-2052_profile_x_axis  remote  Bob    dev_1.4, DB-2055_pws_units, DB-2056_airport_loc +5 more
+  DB-2179_tile_cache_oom  remote  Alice  dev_1.4
+  [dry-run] would delete 1 local + 2 remote branch(es)
+
+Would delete 3 branch ref(s).
+```
+
+The "Merged elsewhere" scan runs one `git for-each-ref --merged=<tip>` per distinct branch
+tip (in parallel, `--jobs N`), not a `merge-base` call per branch pair. Tips already merged
+into the default branch are skipped, since anything they contain is already a delete
+candidate or protected.
+
+### Delete one branch everywhere
+
+```bash
+git-tool.py --delete-branch old-feature --dry-run ~/projects
+git-tool.py --delete-branch old-feature ~/projects
+```
+
+### List tags with the app version at each tag
+
+```bash
+git-tool.py --tag-list .
+git-tool.py --tag-list --tag-file app/build.gradle --tag-text ext.PLUGIN_VERSION .
+```
+
 ### Branch details (owner, last change, merged / PR / safe to delete)
 
 ```bash
@@ -185,6 +264,15 @@ git-tool.py --branch-details --jobs 16 ~/projects
 ```bash
 git-tool.py --actions-delete-runs-keep 3 --dry-run .
 git-tool.py --actions-delete-runs-keep 3 ~/projects
+```
+
+### List or clone a GitHub user's / org's repos
+
+```bash
+git-tool.py --host github.com/landenlabs --repo-list
+git-tool.py --host landenlabs --repo-list "py.*"
+git-tool.py --host github.com/landenlabs --repo-clone "py.*"
+git-tool.py --host landenlabs --repo-clone py-tool1 --repo-clone py-tool2
 ```
 
 ### Search by regex pattern
@@ -236,8 +324,46 @@ Notes:
 | `--dirty` | Only show repos with non-clean status |
 | `--verbose` / `-v` | Full status output and scanning details |
 | `--no-color` | Disable ANSI color output |
+| `--tag-list` | All tags with date and the `--tag-text` line from `--tag-file` |
+| `--tag-file FILE` | File searched by `--tag-list` (default `app/build.gradle`) |
+| `--tag-text TEXT` | Text searched by `--tag-list` (default `ext.PLUGIN_VERSION`) |
+| `--branch-details` | Every branch with owner, last change, merged/PR state |
+| `--jobs` / `-j N` | Parallel workers (default 8) |
 | `--version` | Print version and exit |
 | `--help` | Show full usage and examples |
+
+### Branch cleanup flags
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--delete-merged` | Delete local + origin branches merged into the default branch |
+| `--match GLOB` | Only branches whose name matches GLOB |
+| `--owner TEXT_OR_GLOB` | Only branches whose tip author name/email contains TEXT or matches GLOB |
+| `--local-only` | Delete only local branches; never touch origin |
+| `--include-pr-merged` | Also delete squash/rebase-merged PR branches with no later commits |
+| `--no-merged-elsewhere` | Hide the report-only "Merged elsewhere (not deleted)" table |
+| `--yes` / `-y` | Delete without prompting |
+| `--delete-branch BRANCH` | Delete one branch locally and on origin, with confirmation |
+| `--dry-run` | Show what would be deleted without deleting |
+
+### Action flags
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--clean` | `fetch --prune`, `worktree prune`, `gc --auto` |
+| `--pull` | `git pull` each repo with a remote |
+| `--push` | Stage all, commit with `--message`/`-m`, push |
+| `--main` | Rename `master` → `main` (local + remote) |
+| `--actions-delete-runs-keep [N]` | Keep only the newest N GitHub Actions runs per workflow |
+| `--dry-run` | Preview any of the above without changes |
+
+### GitHub repo flags
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--host OWNER_OR_URL` | GitHub user/org, e.g. `landenlabs` or `github.com/landenlabs` |
+| `--repo-list [REGEX]` | List the owner's repos, optionally filtered |
+| `--repo-clone REGEX` | Clone matching repos, skipping existing directories (repeatable) |
 
 ### Download flags
 
@@ -248,7 +374,7 @@ Notes:
 | `--include PATTERN` | Only fetch files matching a glob pattern (repeatable) |
 | `--exclude PATTERN` | Skip files matching a glob pattern (repeatable) |
 | `--output` / `-o` | Local destination file or directory |
-| `--token` | GitHub token for private repos / higher rate limit (or set `GITHUB_TOKEN`) |
+| `--token` | GitHub token for private repos / higher rate limit (or set `GITHUB_TOKEN`); also used by `--repo-list`, `--repo-clone`, `--branch-details`, `--include-pr-merged`, `--actions-delete-runs-keep` |
 
 ---
 
