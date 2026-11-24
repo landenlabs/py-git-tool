@@ -1066,10 +1066,130 @@ def branch_is_merged(git_dir, branch):
     return rc == 0
 
 
+WORKTREE_IGNORED_MAX_NAMES = 4
+WORKTREE_DIRTY_MAX_NAMES = 20
+
+
+def _worktree_records(git_dir):
+    """
+    Parse `git worktree list --porcelain` into a list of dicts, main worktree first:
+    {'path', 'branch' (name or None), 'locked' (reason str or None), 'prunable' (str or None)}.
+    'locked'/'prunable' are '' when git gives no reason, so test them with `is not None`.
+    """
+    out, _, _ = run_git(git_dir, 'worktree', 'list', '--porcelain')
+    records, cur = [], None
+    for line in out.splitlines():
+        if line.startswith('worktree '):
+            cur = {'path': line[len('worktree '):], 'branch': None, 'locked': None, 'prunable': None}
+            records.append(cur)
+        elif cur is None:
+            continue
+        elif line.startswith('branch refs/heads/'):
+            cur['branch'] = line[len('branch refs/heads/'):]
+        elif line == 'locked' or line.startswith('locked '):
+            cur['locked'] = line[len('locked'):].strip()
+        elif line == 'prunable' or line.startswith('prunable '):
+            cur['prunable'] = line[len('prunable'):].strip()
+    return records
+
+
+def _worktree_for_branch(git_dir, branch):
+    """Return the record of the *linked* worktree that has branch checked out, else None."""
+    for rec in _worktree_records(git_dir)[1:]:   # first record is the main worktree
+        if rec['branch'] == branch:
+            return rec
+    return None
+
+
+def _worktree_state(rec):
+    """
+    Classify a linked worktree for removal. Returns a dict:
+      kind:    'missing' | 'locked' | 'dirty' | 'clean' | 'error'
+      dirty:   modified/untracked porcelain lines (ignored files are not dirty)
+      ignored: ignored paths (git worktree remove deletes these too)
+      reason:  lock reason or error text
+    """
+    path = rec['path']
+    st = {'kind': 'clean', 'dirty': [], 'ignored': [], 'reason': ''}
+    if rec['prunable'] is not None or not os.path.isdir(path):
+        st['kind'] = 'missing'
+        return st
+    if rec['locked'] is not None:
+        st['kind'] = 'locked'
+        st['reason'] = rec['locked']
+        return st
+    out, stderr, rc = run_git(path, 'status', '--porcelain', '--ignored')
+    if rc != 0:
+        st['kind'] = 'error'
+        st['reason'] = stderr.strip()
+        return st
+    for line in out.splitlines():
+        if line.startswith('!! '):
+            st['ignored'].append(line[3:])
+        elif line.strip():
+            st['dirty'].append(line)
+    if st['dirty']:
+        st['kind'] = 'dirty'
+    return st
+
+
+def _worktree_desc(rec, st):
+    """One-line state for a worktree, e.g. '/path  (clean)'."""
+    kind = st['kind']
+    if kind == 'clean':
+        state = _c('clean', _GREEN)
+    elif kind == 'dirty':
+        state = _c(f"{_n(len(st['dirty']), 'modified/untracked file')}", _RED)
+    elif kind == 'locked':
+        state = _c('locked' + (f": {st['reason']}" if st['reason'] else ''), _YELLOW)
+    elif kind == 'missing':
+        state = _c('missing on disk, will be pruned', _YELLOW)
+    else:
+        state = _c(f"status failed: {st['reason']}", _RED)
+    return f"{rec['path']}  ({state})"
+
+
+def _worktree_ignored_note(st):
+    """'+ ignored files: a, b ...' when the worktree has ignored files, else ''."""
+    ign = st['ignored']
+    if not ign:
+        return ''
+    more = ' ...' if len(ign) > WORKTREE_IGNORED_MAX_NAMES else ''
+    return (f"+ ignored files (deleted with the worktree): "
+            f"{', '.join(ign[:WORKTREE_IGNORED_MAX_NAMES])}{more}")
+
+
+def _worktree_skip_reason(rec, st):
+    """Reason string if this worktree must not be removed (without --force-worktree), else None."""
+    if st['kind'] == 'dirty':
+        return f"worktree {rec['path']} has uncommitted changes"
+    if st['kind'] == 'locked':
+        return f"worktree {rec['path']} is locked" + (f": {st['reason']}" if st['reason'] else '')
+    if st['kind'] == 'error':
+        return f"worktree {rec['path']} status failed: {st['reason']}"
+    return None
+
+
+def _remove_worktree(git_dir, rec, st, force=False):
+    """Remove (or just prune, if missing) a linked worktree. Returns error text or None."""
+    if st['kind'] != 'missing':
+        cmd = ['worktree', 'remove'] + (['--force'] if force else []) + [rec['path']]
+        _, stderr, rc = run_git(git_dir, *cmd)
+        if rc != 0:
+            return stderr.strip()
+    run_git(git_dir, 'worktree', 'prune')
+    return None
+
+
 def cmd_delete_branch(git_dirs, args):
-    """Delete a branch both locally and on the remote, after confirmation."""
+    """
+    Delete a branch both locally and on the remote, after confirmation.
+    If the branch is checked out in a clean linked worktree, that worktree is removed first
+    (dirty or locked worktrees are skipped; --force-worktree overrides dirty after a 2nd prompt).
+    """
     branch = args.delete_branch
     dry = args.dry_run
+    force_wt = getattr(args, 'force_worktree', False)
     deleted = skipped = errors = 0
 
     for d in git_dirs:
@@ -1094,29 +1214,100 @@ def cmd_delete_branch(git_dirs, args):
             skipped += 1
             continue
 
+        records = _worktree_records(d) if has_local else []
+        if records and records[0]['branch'] == branch:
+            # d is itself a linked worktree and the branch is checked out in the main one.
+            print(f"  skip  {d}  (branch '{branch}' is currently checked out in main worktree "
+                  f"{records[0]['path']})")
+            skipped += 1
+            continue
+        wt = next((r for r in records[1:] if r['branch'] == branch), None)
+        wt_st = _worktree_state(wt) if wt else None
+
         merged = branch_is_merged(d, branch) if has_local else None
         merged_str = ('merged' if merged else 'NOT merged') if merged is not None else 'unknown'
-        merged_disp = _c(merged_str, _GREEN) if merged else merged_str
+        merged_disp = _c(merged_str, _GREEN) if merged else (
+            _c(merged_str, _RED) if merged is False else merged_str)
 
         where = []
         if has_local:  where.append('local')
         if has_remote: where.append('remote')
+        where_str = ', '.join(where)
 
         print(d)
-        print(f"  branch:  {branch}  ({', '.join(where)})  [{merged_disp}]")
+        print(f"  branch:  {branch}  ({where_str})  [{merged_disp}]")
+        if wt:
+            print(f"  worktree: {_worktree_desc(wt, wt_st)}")
+            note = _worktree_ignored_note(wt_st)
+            if note:
+                print(f"            {note}")
+            if wt_st['kind'] == 'dirty':
+                for line in wt_st['dirty'][:WORKTREE_DIRTY_MAX_NAMES]:
+                    print(f"            {line}")
+                if len(wt_st['dirty']) > WORKTREE_DIRTY_MAX_NAMES:
+                    print(f"            ... +{len(wt_st['dirty']) - WORKTREE_DIRTY_MAX_NAMES} more")
+
+        skip_reason = _worktree_skip_reason(wt, wt_st) if wt else None
+        force_this = bool(skip_reason and force_wt and wt_st['kind'] == 'dirty')
+        if skip_reason and not force_this:
+            print(f"  {'[dry-run] would ' if dry else ''}skip  ({skip_reason})")
+            print()
+            skipped += 1
+            continue
+
+        if wt and wt_st['kind'] == 'missing':
+            action = f"prune missing worktree {wt['path']} and delete"
+        elif wt:
+            action = f"{'force-' if force_this else ''}remove worktree {wt['path']} and delete"
+        else:
+            action = 'delete'
 
         if dry:
-            print(f"  [dry-run] would delete {', '.join(where)}")
+            print(f"  [dry-run] would {action} {where_str}"
+                  + ("  (after a second confirmation)" if force_this else ''))
             print()
             deleted += 1
             continue
 
-        reply = input(f"  Delete branch '{branch}' ({', '.join(where)}, {merged_disp})? [y/N] ").strip().lower()
+        if merged is False:
+            lost = ' and removing the worktree' if wt else ''
+            print(_c(f"  WARNING: '{branch}' is NOT merged into HEAD; deleting it{lost} "
+                     f"can lose commits.", _RED))
+
+        if wt:
+            prompt = f"  {action[0].upper() + action[1:]} branch '{branch}' ({where_str}, {merged_disp})? [y/N] "
+        else:
+            prompt = f"  Delete branch '{branch}' ({where_str}, {merged_disp})? [y/N] "
+        reply = input(prompt).strip().lower()
         if reply != 'y':
             print("  skipped")
             print()
             skipped += 1
             continue
+
+        if force_this:
+            print(_c(f"  --force-worktree: these uncommitted changes in {wt['path']} "
+                     f"will be LOST:", _RED))
+            for line in wt_st['dirty']:
+                print(f"    {line}")
+            reply = input("  Really discard them and force-remove the worktree? [y/N] ").strip().lower()
+            if reply != 'y':
+                print("  skipped")
+                print()
+                skipped += 1
+                continue
+
+        if wt:
+            err = _remove_worktree(d, wt, wt_st, force=force_this)
+            if err:
+                print(f"  ERROR (worktree remove): {err}", file=sys.stderr)
+                errors += 1
+                print()
+                continue
+            if wt_st['kind'] == 'missing':
+                print(f"  pruned missing worktree {wt['path']}")
+            else:
+                print(f"  removed worktree {wt['path']}")
 
         ok = True
         if has_local:
@@ -1513,13 +1704,6 @@ FF_COPY_SUFFIXES = ('_main', '_dev')
 MERGED_INTO_MAX_NAMES = 3
 
 
-def _worktree_branches(git_dir):
-    """Return the set of local branch names checked out in any worktree."""
-    out, _, _ = run_git(git_dir, 'worktree', 'list', '--porcelain')
-    prefix = 'branch refs/heads/'
-    return {line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)}
-
-
 def _owner_matches(owner_filter, name, email):
     """
     Case-insensitive match of --owner against the author name or email.
@@ -1537,7 +1721,8 @@ def _merged_candidates(d, pattern, include_pr, token, warnings, local_only=False
     Find merged branches in one repo.
     Returns (default_ref, {name: {'local': (reason, owner)|None, 'remote': ...}}, protected_hits, keep)
     or (None, None, reason_skipped, None). owner is the author of the branch tip commit;
-    keep is the set of default/current/worktree branch names that are never deleted.
+    keep is the set of default/current/worktree branch names. Candidates checked out in a
+    linked worktree carry that worktree's record under 'worktree' (else None).
     """
     default_ref, default_name = get_default_branch(d)
     current = get_branch(d)
@@ -1545,7 +1730,13 @@ def _merged_candidates(d, pattern, include_pr, token, warnings, local_only=False
     if rc != 0 and default_name not in ('main', 'master'):
         return None, None, 'cannot determine the default branch', None
 
-    keep = {default_name, current} | _worktree_branches(d)
+    records = _worktree_records(d)
+    # Branches in linked worktrees become candidates tagged with 'worktree'; the caller
+    # skips them unless --include-worktrees. keep still lists them so the report-only
+    # "Merged elsewhere" scan never shows them.
+    linked = {r['branch']: r for r in records[1:] if r['branch']}
+    hard_keep = {default_name, current} | {r['branch'] for r in records[:1] if r['branch']}
+    keep = hard_keep | set(linked)
 
     scopes = ['refs/heads'] if local_only else ['refs/heads', 'refs/remotes/origin']
     out, _, _ = run_git(d, 'for-each-ref',
@@ -1587,10 +1778,11 @@ def _merged_candidates(d, pattern, include_pr, token, warnings, local_only=False
         if reason is None:
             continue
 
-        if name in keep or any(fnmatch.fnmatchcase(name, p) for p in PROTECTED_BRANCHES):
+        if name in hard_keep or any(fnmatch.fnmatchcase(name, p) for p in PROTECTED_BRANCHES):
             protected_hits.add(name)
             continue
-        candidates.setdefault(name, {'local': None, 'remote': None})[where] = (reason, author)
+        c = candidates.setdefault(name, {'local': None, 'remote': None, 'worktree': linked.get(name)})
+        c[where] = (reason, author)
 
     return default_ref, candidates, protected_hits, keep
 
@@ -1736,10 +1928,31 @@ def cmd_delete_merged(git_dirs, args):
             print(f"  skip  {d}  ({info})")
             continue
 
+        # Branches checked out in a linked worktree: skipped unless --include-worktrees,
+        # and even then only if the worktree is clean (or missing on disk) and not locked.
+        wt_skipped = []    # [(name, reason)]
+        wt_remove = {}     # name -> (worktree record, state)
+        for name in sorted(candidates):
+            rec = candidates[name]['worktree']
+            if not rec:
+                continue
+            if not args.include_worktrees:
+                reason = f"in worktree {rec['path']}"
+            elif not candidates[name]['local']:
+                reason = f"in worktree {rec['path']}; local branch is not merged"
+            else:
+                st = _worktree_state(rec)
+                reason = _worktree_skip_reason(rec, st)
+                if reason is None:
+                    wt_remove[name] = (rec, st)
+            if reason:
+                wt_skipped.append((name, reason))
+                del candidates[name]
+
         elsewhere = [] if args.no_merged_elsewhere else _merged_elsewhere(
             d, default_ref, candidates, keep, pattern, args.local_only, args.owner, args.jobs)
 
-        if not candidates and not elsewhere:
+        if not candidates and not elsewhere and not wt_skipped:
             if args.verbose:
                 print(f"{d}\n  no merged branches to delete\n")
             continue
@@ -1755,10 +1968,18 @@ def cmd_delete_merged(git_dirs, args):
                 hits = [c[w] for w in ('local', 'remote') if c[w]]
                 where = '+'.join(w for w in ('local', 'remote') if c[w])
                 owners = ', '.join(dict.fromkeys(owner for _, owner in hits))   # dedupe, keep order
-                rows.append((name, where, owners, hits[0][0]))
+                state = hits[0][0] + (' + remove worktree' if name in wt_remove else '')
+                rows.append((name, where, owners, state))
             _print_table(('BRANCH', 'WHERE', 'OWNER', 'STATE'), rows, _GREEN)
         else:
             print("  no merged branches to delete")
+        for name, (rec, st) in wt_remove.items():
+            print(f"  worktree: {name}  {_worktree_desc(rec, st)}")
+            note = _worktree_ignored_note(st)
+            if note:
+                print(f"            {note}")
+        for name, reason in wt_skipped:
+            print(f"  skipped  {name}  ({reason})")
         if info and args.verbose:
             print(f"  protected (not deleted): {', '.join(sorted(info))}")
 
@@ -1772,19 +1993,35 @@ def cmd_delete_merged(git_dirs, args):
             print()
             continue
 
-        summary = f"{len(locals_)} local + {len(remotes_)} remote branch(es)"
+        summary = f"delete {len(locals_)} local + {len(remotes_)} remote branch(es)"
+        if wt_remove:
+            summary = f"remove {_n(len(wt_remove), 'worktree')} and {summary}"
         if dry:
-            print(f"  [dry-run] would delete {summary}\n")
+            print(f"  [dry-run] would {summary}\n")
             total_deleted += len(locals_) + len(remotes_)
             continue
 
         if not args.yes:
-            reply = input(f"  Delete {summary}? [y/N] ").strip().lower()
+            reply = input(f"  {summary[0].upper() + summary[1:]}? [y/N] ").strip().lower()
             if reply != 'y':
                 print("  skipped\n")
                 continue
 
         deleted = errors = 0
+        failed_wt = set()
+        for name, (rec, st) in wt_remove.items():
+            err = _remove_worktree(d, rec, st)
+            if err:
+                print(f"  ERROR (worktree remove {rec['path']}): {err}", file=sys.stderr)
+                errors += 1
+                failed_wt.add(name)
+            else:
+                print(f"  {'pruned missing' if st['kind'] == 'missing' else 'removed'} "
+                      f"worktree {rec['path']}")
+        # A branch whose worktree could not be removed is still checked out: leave it alone.
+        locals_  = [n for n in locals_ if n not in failed_wt]
+        remotes_ = [n for n in remotes_ if n not in failed_wt]
+
         for name in locals_:
             _, stderr, rc = run_git(d, 'branch', '-D', name)
             if rc != 0:
@@ -2206,6 +2443,10 @@ def main():
   # shows merge status; runs "git fetch --all --prune" first):
   git-tool.py --delete-branch old-feature ~/projects
   git-tool.py --delete-branch old-feature --dry-run ~/projects
+  # If the branch is checked out in a linked worktree, the worktree is shown (clean /
+  # N modified/untracked files / locked) and removed first when clean; dirty or locked
+  # worktrees are skipped. Force-remove a dirty one (asks twice, lists the files):
+  git-tool.py --delete-branch old-feature --force-worktree .
 
   # Delete every branch already merged into the default branch (local + origin;
   # one prompt per repo; default/current/protected branches are never touched):
@@ -2221,6 +2462,9 @@ def main():
   # not merged into the default branch but contained in another branch (e.g. dev_1.4).
   # Turn it off with --no-merged-elsewhere:
   git-tool.py --delete-merged --dry-run --no-merged-elsewhere ~/projects
+  # Branches checked out in a linked worktree are listed as "skipped (in worktree PATH)".
+  # Also remove their worktrees when clean (dirty/locked ones stay skipped):
+  git-tool.py --delete-merged --include-worktrees --dry-run .
 
   # List every tag with its date and a version line from a file at that tag:
   git-tool.py --tag-list .
@@ -2329,15 +2573,26 @@ Notes:
     parser.add_argument(
         '--delete-branch', metavar='BRANCH',
         help='Delete BRANCH both locally and on the remote (with confirmation, '
-             'showing merge status); runs "git fetch --all --prune" first',
+             'showing merge status); runs "git fetch --all --prune" first.\n'
+             'If BRANCH is checked out in a clean linked worktree, removes that worktree first',
+    )
+    parser.add_argument(
+        '--force-worktree', action='store_true',
+        help='With --delete-branch, force-remove a linked worktree that has uncommitted\n'
+             'changes (after a second confirmation listing them). Locked worktrees are never removed',
     )
     parser.add_argument(
         '--delete-merged', action='store_true',
         help='Delete every local and origin branch already merged into the default branch.\n'
-             'Never deletes the default, checked-out, worktree, or protected branches\n'
+             'Never deletes the default, checked-out, worktree (see --include-worktrees), or protected branches\n'
              '(main, master, develop, development, release, release/*). Prompts once per\n'
              'repo; honors --dry-run. Runs "git fetch --all --prune" first.\n'
              'Also reports (never deletes) branches merged into some other branch only',
+    )
+    parser.add_argument(
+        '--include-worktrees', action='store_true',
+        help='With --delete-merged, also delete merged branches checked out in a linked\n'
+             'worktree, removing the worktree first; dirty or locked worktrees are skipped',
     )
     parser.add_argument(
         '--no-merged-elsewhere', action='store_true',
@@ -2509,9 +2764,13 @@ Notes:
                      "--delete-merged, or --actions-delete-runs-keep")
 
     if not args.delete_merged and (args.match != '*' or args.include_pr_merged or args.yes
-                                   or args.local_only or args.owner or args.no_merged_elsewhere):
+                                   or args.local_only or args.owner or args.no_merged_elsewhere
+                                   or args.include_worktrees):
         parser.error("--match, --include-pr-merged, --local-only, --owner, --no-merged-elsewhere, "
-                     "and --yes require --delete-merged")
+                     "--include-worktrees, and --yes require --delete-merged")
+
+    if args.force_worktree and not args.delete_branch:
+        parser.error("--force-worktree requires --delete-branch")
 
     # Merge --dir and trailing positional dirs into one list; default to cwd
     all_dirs = args.dir + args.dirs or ['.']
