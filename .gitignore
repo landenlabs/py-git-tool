@@ -1,37 +1,79 @@
-# .gitignore python
+# .gitignore - LanDen Labs Python projects (shared across all py-* repos)
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
 
 # Distribution / packaging
 .Python
 build/
 dist/
-__pycache__/
-.claude/
-.claude/**
+*.egg-info/
+*.egg
+MANIFEST
 
-.legacy
-.legacy/**
- 
-# Translations
-*.mo
-*.pot
+# PyInstaller: *.spec is intentionally NOT ignored -- several repos commit
+# their .spec file and build it via build.sh. Delete stray generated specs.
 
 # PyBuilder
 .pybuilder/
 target/
 
-# Environments
-.env
-.envrc
+# Translations
+*.mo
+*.pot
+
+# Virtual environments
 .venv
-env/
 venv/
+env/
 ENV/
 env.bak/
 venv.bak/
-tmp/
-.idea/
 
-# PyPI configuration file
+# Secrets / local config -- never commit these
+.env
+.envrc
 .pypirc
+serviceAccountKey.json
+*serviceAccountKey*.json
 
+# Unit tests / coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+
+# Type checkers / linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.ruff_cache/
+
+# IDEs / tools
+.idea/
+.vscode/
+.claude/
+.claude/**
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Local scratch / runtime data
+tmp/
+.legacy
+.legacy/**
 PROFILE_DIR/
